@@ -1,0 +1,16 @@
+[project]
+name = "ascii-earth-forecast"
+version = "0.1.0"
+description = "Daily weather and satellite position forecasts scored against this week's data"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2,<3", "sgp4>=2.24,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["forecast"]
