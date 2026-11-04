@@ -121,6 +121,35 @@ def test_weather_update_end_to_end_and_incremental(tmp_path, monkeypatch):
     assert asked == [0]
 
 
+def test_cloud_score_uses_the_clipped_forecast_the_map_shows(monkeypatch):
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    history = {d: (np.full(SHAPE, 90, dtype=np.float32), np.zeros(SHAPE, dtype=np.float32)) for d in days}
+    monkeypatch.setattr(run.weather, "predict", lambda values, day: (np.full(SHAPE, 150.0), values[:day].mean(axis=0)))
+    section = run.weather_section(days, history, TODAY)
+    # 150 clips to 100, so the score is 10 points from the actual 90, not 60.
+    assert section["week"]["cloud"]["model"] == 10
+    assert section["week"]["temp"]["model"] == 150
+
+
+def test_section_publishes_the_fit_behind_the_scored_map(tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch, "weather", lambda past: hourly(past))
+    model = run.update_weather(tmp_path, TODAY)["model"]
+    assert model["date"] == (TODAY - timedelta(days=1)).isoformat()
+    assert model["ridge"] == run.weather.RIDGE
+    assert [b["name"] for b in model["bands"]] == list(run.weather.BAND_NAMES)
+    json.dumps(model, allow_nan=False)
+
+
+def test_today_names_places_with_the_clipped_cloud_forecast(monkeypatch):
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    history = {d: (np.full(SHAPE, 90, dtype=np.float32), np.zeros(SHAPE, dtype=np.float32)) for d in days}
+    monkeypatch.setattr(run.weather, "predict", lambda values, day: (np.full(SHAPE, 150.0), values[:day].mean(axis=0)))
+    places = run.weather_section(days, history, TODAY)["today"]["places"]
+    assert [p["place"] for p in places] == [c[0] for c in run.weather.CELLS]
+    assert {p["cloud"] for p in places} == {100.0}
+    assert {p["temp"] for p in places} == {150.0}
+
+
 def test_satellites_score_only_with_history(tmp_path, monkeypatch):
     text = open("tests/active-sample.csv").read()
     monkeypatch.setattr(fetch, "elements", lambda: text)

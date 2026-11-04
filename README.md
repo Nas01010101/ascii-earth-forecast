@@ -53,7 +53,7 @@ A GitHub Actions job runs once a day and force-pushes the `data` branch, which h
 
 | File | Contents |
 |---|---|
-| `forecast.json` | scores, ASCII maps, and per-source status |
+| `forecast.json` | scores, ASCII maps, per-source status, the weights and loss of each band (`weather.model`), and today's forecast globally and at three cells (`weather.today`) |
 | `planet.bin` | cloud and rain grids every 3 hours for today and tomorrow, read by the planet |
 | `sats.bin` | satellite elements for the browser |
 | `history.npz` | up to 60 days of daily means |

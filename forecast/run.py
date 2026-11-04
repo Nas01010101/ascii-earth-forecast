@@ -23,6 +23,7 @@ MIN_HOURS = 18
 FRAME_HOURS = 3
 RAMP = " .:-=+*#%@"
 ERROR_RAMP_MAX = 50
+CLOUD_RANGE = (0, 100)
 
 
 def write_atomic(path, data):
@@ -128,10 +129,14 @@ def weather_section(days, history, today):
         row = {"date": days[target]}
         for name, values in series.items():
             forecast, trailing = weather.predict(values, target)
+            # Cover outside 0..100 cannot happen, and the score must describe the map the page draws.
+            if name == "cloud":
+                forecast = np.clip(forecast, *CLOUD_RANGE)
             row[name] = weather.score(values[target], forecast, values[target - 1], trailing)
             keep[name] = forecast, values[target]
         scored.append(row)
     today_cloud, _ = weather.predict(cloud, len(days))
+    today_cloud = np.clip(today_cloud, *CLOUD_RANGE)
     today_temp, _ = weather.predict(temp, len(days))
     forecast, actual = keep["cloud"]
     week = {name: {k: round(float(np.mean([r[name][k] for r in scored])), 2) for k in scored[0][name]} for name in series}
@@ -142,15 +147,21 @@ def weather_section(days, history, today):
         "features": list(weather.FEATURES),
         "today": {
             "date": today.isoformat(),
-            "cloud_mean": round(_area_mean(np.clip(today_cloud, 0, 100)), 1),
+            "cloud_mean": round(_area_mean(today_cloud), 1),
             "temp_mean": round(_area_mean(today_temp), 1),
-            "map": picture(np.clip(today_cloud, 0, 100), 100),
+            "places": weather.at_places(today_cloud, today_temp),
+            "map": picture(today_cloud, 100),
         },
         "last_scored": {
             "date": scored[-1]["date"],
-            "forecast": picture(np.clip(forecast, 0, 100), 100),
+            "forecast": picture(forecast, 100),
             "actual": picture(actual, 100),
-            "error": picture(np.abs(np.clip(forecast, 0, 100) - actual), ERROR_RAMP_MAX),
+            "error": picture(np.abs(forecast - actual), ERROR_RAMP_MAX),
+        },
+        "model": {
+            "date": days[-1],
+            "ridge": weather.RIDGE,
+            "bands": weather.explain(cloud, len(days) - 1, CLOUD_RANGE),
         },
     }
 

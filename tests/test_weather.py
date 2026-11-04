@@ -47,3 +47,44 @@ def test_mae_weights_by_area():
     equator = a.copy()
     equator[len(LATS) // 2] = 10
     assert weather.mae(a, polar) < weather.mae(a, equator)
+
+
+def test_published_weights_minimise_the_published_loss():
+    series = ar_series()
+    _, anomaly, fits = weather.fit(series, 30)
+    x, y, area = weather.training_rows(anomaly, weather.BANDS[1])
+    objective = lambda w: (area * (y - x @ w) ** 2).sum() + weather.RIDGE * w @ w
+    w = fits[1]["weights"]
+    assert objective(w) == pytest.approx(fits[1]["loss"])
+    for nudge in np.eye(len(w)) * 1e-3:
+        assert objective(w) < objective(w + nudge)
+        assert objective(w) < objective(w - nudge)
+
+
+def test_worked_cells_match_the_forecast():
+    series = ar_series()
+    day = 30
+    forecast, _ = weather.predict(series, day)
+    for band in weather.explain(series, day, (0, 100)):
+        cell = band["cell"]
+        i, j = np.abs(LATS - cell["lat"]).argmin(), np.abs(LONS - cell["lon"]).argmin()
+        assert cell["predicted"] == pytest.approx(np.clip(forecast[i, j], 0, 100), abs=0.051)
+        assert cell["actual"] == pytest.approx(series[day, i, j], abs=0.051)
+        assert cell["mean"] + cell["change"] == pytest.approx(forecast[i, j], abs=0.11)
+        assert len(cell["inputs"]) == len(band["weights"]) == len(weather.FEATURES)
+
+
+def test_worked_cell_sits_in_its_band():
+    for name, band, (_, lat, _) in zip(weather.BAND_NAMES, weather.BANDS, weather.CELLS):
+        assert band[np.abs(LATS - lat).argmin()], name
+
+
+def test_places_read_their_own_cell():
+    cloud, temp = np.zeros(SHAPE), np.zeros(SHAPE)
+    for k, (_, lat, lon) in enumerate(weather.CELLS, start=1):
+        i, j = np.abs(LATS - lat).argmin(), np.abs(LONS - lon).argmin()
+        cloud[i, j], temp[i, j] = 10 * k, -k
+    assert weather.at_places(cloud, temp) == [
+        {"place": place, "cloud": 10.0 * k, "temp": -1.0 * k}
+        for k, (place, _, _) in enumerate(weather.CELLS, start=1)
+    ]
