@@ -13,12 +13,12 @@ from pathlib import Path
 
 import numpy as np
 
-from . import fetch, orbits, weather
+from . import drift, fetch, orbits, weather
 
 HISTORY_DAYS = 60
 SCORED_DAYS = 7
 LOSS_DAYS = 28
-SNAPSHOT_DAYS = 9
+SNAPSHOT_DAYS = 38  # a 7-day forecast, its 30-day update count, and the day it is checked
 MAX_MISSING = 0.01
 MIN_HOURS = 18
 FRAME_HOURS = 3
@@ -250,25 +250,25 @@ def update_weather(root, today):
     return {**section, "losses": forecast_losses(forecasts, history)}
 
 
-def _snapshot(root, day):
-    path = root / "elements" / f"{day.isoformat()}.csv.gz"
-    return orbits.parse(gzip.decompress(path.read_bytes()).decode()) if path.exists() else None
+def stored_losses(root):
+    path = root / "forecast.json"
+    return json.loads(path.read_text()).get("satellites", {}).get("losses", []) if path.exists() else []
 
 
-def horizon_row(old, new, before_old, before_new, days):
-    """Scores one horizon. The drift fit only sees the pair ending yesterday, never today's elements."""
-    pair = orbits.compare(old, new)
-    if pair is None or not pair["id"].size:
-        return None
-    row = {"days": days, **orbits.regimes(pair)}
-    iss = np.flatnonzero(pair["id"] == orbits.ISS)
-    if iss.size:
-        row["iss_km"] = round(float(pair["km"][iss[0]]), 2)
-    train = orbits.compare(before_old, before_new) if before_old and before_new else None
-    weights = orbits.fit_drift(train) if train else None
-    if weights is not None and (pair["rev"] >= orbits.LEO_REV_PER_DAY).any():
-        row["low_corrected"] = orbits.summary(orbits.corrected_km(pair, weights))
-    return row
+def satellite_losses(rows, snapshots, today):
+    """Adds a row for each held day that has none, keeping the last LOSS_DAYS. No row is rewritten.
+
+    A row replayed from stored snapshots reads only what was held on its day, and stays flagged as not issued.
+    """
+    done = {row["date"] for row in rows}
+    nets = drift.load_nets()
+    rows = list(rows)
+    for day in sorted(snapshots):
+        if day.isoformat() not in done:
+            days = drift.score_day(snapshots, day, nets)
+            if days:
+                rows.append({"date": day.isoformat(), "issued": day == today, "days": days})
+    return sorted(rows, key=lambda row: row["date"])[-LOSS_DAYS:]
 
 
 def update_satellites(root, today):
@@ -283,14 +283,10 @@ def update_satellites(root, today):
         write_atomic(path, gzip.compress(text.encode(), mtime=0))
     for old in sorted(folder.glob("*.csv.gz"))[:-SNAPSHOT_DAYS]:
         old.unlink()
-    snaps = {d: _snapshot(root, today - timedelta(days=d)) for d in range(0, SCORED_DAYS + 2)}
-    rows = []
-    for days in range(1, SCORED_DAYS + 1):
-        if snaps[days]:
-            row = horizon_row(snaps[days], snaps[0], snaps.get(days + 1), snaps[1], days)
-            if row:
-                rows.append(row)
-    return {"as_of": today.isoformat(), "count": len(snaps[0]), "horizons": rows}
+    snapshots = {date.fromisoformat(p.name.split(".")[0]): orbits.parse(gzip.decompress(p.read_bytes()).decode())
+                 for p in folder.glob("*.csv.gz")}
+    return {"as_of": today.isoformat(), "count": len(snapshots[today]),
+            "losses": satellite_losses(stored_losses(root), snapshots, today)}
 
 
 def run(root, today, updates):

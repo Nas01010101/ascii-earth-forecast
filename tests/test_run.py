@@ -154,7 +154,7 @@ def test_satellites_score_only_with_history(tmp_path, monkeypatch):
     text = open("tests/active-sample.csv").read()
     monkeypatch.setattr(fetch, "elements", lambda: text)
     first = run.update_satellites(tmp_path, TODAY)
-    assert first["horizons"] == []
+    assert first["losses"] == []
     calls = []
     monkeypatch.setattr(fetch, "elements", lambda: calls.append(1) or text)
     run.update_satellites(tmp_path, TODAY)
