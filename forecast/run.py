@@ -8,7 +8,7 @@ import json
 import os
 import struct
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +17,7 @@ from . import fetch, orbits, weather
 
 HISTORY_DAYS = 60
 SCORED_DAYS = 7
+LOSS_DAYS = 28
 SNAPSHOT_DAYS = 9
 MAX_MISSING = 0.01
 MIN_HOURS = 18
@@ -49,6 +50,25 @@ def save_history(root, history):
                         cloud=np.stack([history[d][0] for d in days]),
                         temp=np.stack([history[d][1] for d in days]))
     os.replace(temp, root / "history.npz")
+
+
+def load_forecasts(root):
+    path = root / "forecasts.npz"
+    if not path.exists():
+        return {}
+    with np.load(path) as saved:
+        days, cloud, temp, issued = saved["days"], saved["cloud"], saved["temp"], saved["issued"]
+    return {str(d): (cloud[i], temp[i], bool(issued[i])) for i, d in enumerate(days)}
+
+
+def save_forecasts(root, forecasts):
+    days = sorted(forecasts)
+    temp = root / "forecasts.tmp.npz"
+    np.savez_compressed(temp, days=np.array(days),
+                        cloud=np.stack([forecasts[d][0] for d in days]).astype(np.float32),
+                        temp=np.stack([forecasts[d][1] for d in days]).astype(np.float32),
+                        issued=np.array([forecasts[d][2] for d in days]))
+    os.replace(temp, root / "forecasts.npz")
 
 
 def add_days(history, hours, fields, today):
@@ -116,6 +136,38 @@ def picture(field, top):
     return ["".join(RAMP[i] for i in row) for row in index[::-1]]
 
 
+def _forecast(cloud, temp, target):
+    """Forecasts day index target from the days before it. Cover outside 0..100 cannot happen."""
+    return np.clip(weather.predict(cloud, target)[0], *CLOUD_RANGE), weather.predict(temp, target)[0]
+
+
+def keep_forecasts(forecasts, days, history, today):
+    """Stores today's forecast as issued and replays the recent days that have none. No entry is rewritten.
+
+    A replay runs the same code on the stored days before its target, and stays flagged as not issued.
+    """
+    cloud = np.stack([history[d][0] for d in days])
+    temp = np.stack([history[d][1] for d in days])
+    if today.isoformat() not in forecasts:
+        forecasts[today.isoformat()] = (*_forecast(cloud, temp, len(days)), True)
+    for target in range(max(len(days) - LOSS_DAYS, weather.MIN_TRAIN_DAYS + 3), len(days)):
+        if days[target] not in forecasts:
+            forecasts[days[target]] = (*_forecast(cloud, temp, target), False)
+
+
+def forecast_losses(forecasts, history):
+    """Area-weighted squared error of each stored forecast whose day has finished, and of repeating the day before."""
+    rows = []
+    for day in sorted(set(forecasts) & set(history))[-LOSS_DAYS:]:
+        before = history.get((date.fromisoformat(day) - timedelta(days=1)).isoformat())
+        row = {"date": day, "issued": forecasts[day][2]}
+        for i, name in enumerate(("cloud", "temp")):
+            row[name] = {"model": round(weather.mse(history[day][i], forecasts[day][i]), 1),
+                         "repeat": round(weather.mse(history[day][i], before[i]), 1) if before else None}
+        rows.append(row)
+    return rows
+
+
 def weather_section(days, history, today):
     if len(days) <= weather.MIN_TRAIN_DAYS + 3:
         raise fetch.SourceError(f"weather: {len(days)} consecutive days is too few to score")
@@ -135,9 +187,7 @@ def weather_section(days, history, today):
             row[name] = weather.score(values[target], forecast, values[target - 1], trailing)
             keep[name] = forecast, values[target]
         scored.append(row)
-    today_cloud, _ = weather.predict(cloud, len(days))
-    today_cloud = np.clip(today_cloud, *CLOUD_RANGE)
-    today_temp, _ = weather.predict(temp, len(days))
+    today_cloud, today_temp = _forecast(cloud, temp, len(days))
     forecast, actual = keep["cloud"]
     week = {name: {k: round(float(np.mean([r[name][k] for r in scored])), 2) for k in scored[0][name]} for name in series}
     return {
@@ -192,7 +242,12 @@ def update_weather(root, today):
     write_atomic(root / "planet.bin", planet_frames(hours, fields, today))
     add_days(history, hours, fields, today)
     save_history(root, history)
-    return weather_section(consecutive(history, today), history, today)
+    days = consecutive(history, today)
+    section = weather_section(days, history, today)
+    forecasts = load_forecasts(root)
+    keep_forecasts(forecasts, days, history, today)
+    save_forecasts(root, forecasts)
+    return {**section, "losses": forecast_losses(forecasts, history)}
 
 
 def _snapshot(root, day):

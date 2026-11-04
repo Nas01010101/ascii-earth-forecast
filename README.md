@@ -41,6 +41,7 @@ against persistence and trailing mean
 ## Scoring
 
 - **Weather.** Cloud cover and 2 m temperature. Each scored day is predicted by a model trained only on earlier days, and is predicted again on each run from the stored days, so the table is a backtest of the method and not a record of maps published earlier. Baselines: yesterday's value (persistence) and the mean of the earlier days.
+- **Past forecasts.** Each run keeps that day's forecast in `forecasts.npz`, and `weather.losses` scores the kept forecasts of the last 28 finished days against what happened. The loss is the area-weighted squared error, the data term the ridge minimises. A row has `issued: true` when the forecast was kept on the day it was made and `issued: false` when it was replayed from stored days because no forecast was kept then. A replay uses only earlier days, and a kept forecast is never rewritten.
 - **Satellites.** Elements published 1 to 7 days ago are propagated to the epoch of today's elements. The result is the median distance by orbit regime, plus the ISS. The drift correction is fitted on the pair ending yesterday and never sees today's elements.
 
 "Actual" is a public reference with its own error, which these scores do not include. For weather it is Open-Meteo's model output for past hours, not station readings. For satellites it is SGP4 run from the newest published elements, not a tracking measurement.
@@ -53,10 +54,11 @@ A GitHub Actions job runs once a day and force-pushes the `data` branch, which h
 
 | File | Contents |
 |---|---|
-| `forecast.json` | scores, ASCII maps, per-source status, the weights and loss of each band (`weather.model`), and today's forecast globally and at three cells (`weather.today`) |
+| `forecast.json` | scores, ASCII maps, per-source status, the weights and loss of each band (`weather.model`), today's forecast globally and at three cells (`weather.today`), and the loss of past forecasts (`weather.losses`) |
 | `planet.bin` | cloud and rain grids every 3 hours for today and tomorrow, read by the planet |
 | `sats.bin` | satellite elements for the browser |
 | `history.npz` | up to 60 days of daily means |
+| `forecasts.npz` | every forecast kept so far, by day, with its `issued` flag |
 | `elements/` | up to 9 daily element snapshots |
 
 If one source fails, its last good section stays in `forecast.json` and `status` records the failure and the date of that section. This covers any exception in a source. The job exits non-zero only when both sources fail. Stored days are never rewritten; a day left out for missing data is requested again on the next run. Design decisions: [docs/design.md](docs/design.md).

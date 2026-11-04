@@ -11,7 +11,8 @@ Decisions a reader cannot get from the code, and what each one gives up.
 | Scores re-run on each update | Needs only the stored days and cannot leak later data | Scores the method, not the exact map shown the day before; once the 60-day window is full the oldest day differs |
 | Stored days never rewritten | A day used to score another keeps its value | Later revisions by Open-Meteo are ignored |
 | CelesTrak `GROUP=active` CSV | Current elements with no account | No history, so the satellite table fills over the first week |
-| Output on a one-commit `data` branch | Repository stays small; the site reads raw files with no server | No version history of past runs |
+| Past forecasts kept in `forecasts.npz`, first entry of a day wins | A published forecast can be scored later without predicting again | Days before the archive began are replays, marked `issued: false`; the file grows by one day of grids per run |
+| Output on a one-commit `data` branch | Repository stays small; the site reads raw files with no server | No version history of past runs, apart from `forecasts.npz` |
 | One failure per source | A CelesTrak outage does not stop the weather | The page can show sections of different ages, and says so |
 
 ## Assumptions not yet checked against a live run

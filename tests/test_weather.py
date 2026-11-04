@@ -88,3 +88,11 @@ def test_places_read_their_own_cell():
         {"place": place, "cloud": 10.0 * k, "temp": -1.0 * k}
         for k, (place, _, _) in enumerate(weather.CELLS, start=1)
     ]
+
+
+def test_mse_weights_each_row_by_its_area():
+    actual = np.zeros(SHAPE)
+    forecast = np.zeros(SHAPE)
+    forecast[weather.LATS.size // 2] = 10
+    share = float(weather.AREA[weather.LATS.size // 2, 0] / weather.AREA.sum())
+    assert weather.mse(actual, forecast) == pytest.approx(100 * share)

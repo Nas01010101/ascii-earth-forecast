@@ -213,3 +213,104 @@ def test_nan_in_a_score_fails_that_source_and_keeps_the_last_section(tmp_path):
     report = json.loads((tmp_path / "forecast.json").read_text())
     assert report["weather"] == {"keep": 1}
     assert report["status"]["weather"]["ok"] is False
+
+
+def field(value):
+    return np.full(SHAPE, value, dtype=np.float32)
+
+
+def test_losses_score_the_stored_forecast_and_predict_nothing(monkeypatch):
+    def no_prediction(*args):
+        raise AssertionError("a past forecast was computed again")
+    monkeypatch.setattr(run.weather, "predict", no_prediction)
+    history = {"2026-11-01": (field(70), field(1)), "2026-11-02": (field(50), field(4))}
+    forecasts = {"2026-11-02": (field(60), field(2), True), "2026-11-03": (field(0), field(0), True)}
+    # The forecast for today has no actual yet, so only yesterday's is scored.
+    assert run.forecast_losses(forecasts, history) == [{
+        "date": "2026-11-02", "issued": True,
+        "cloud": {"model": 100.0, "repeat": 400.0},
+        "temp": {"model": 4.0, "repeat": 9.0},
+    }]
+
+
+def test_a_day_with_no_day_before_it_has_no_repeat_loss():
+    rows = run.forecast_losses({"2026-11-02": (field(60), field(2), False)}, {"2026-11-02": (field(50), field(4))})
+    assert rows[0]["cloud"]["repeat"] is None
+    json.dumps(rows, allow_nan=False)
+
+
+def test_losses_cover_the_last_few_weeks_while_older_forecasts_stay_stored():
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(run.LOSS_DAYS + 5, 0, -1)]
+    history = {d: (field(50), field(0)) for d in days}
+    rows = run.forecast_losses({d: (field(60), field(0), True) for d in days}, history)
+    assert [r["date"] for r in rows] == days[-run.LOSS_DAYS:]
+
+
+def test_first_run_issues_today_and_replays_the_past(tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch, "weather", lambda past: hourly(past))
+    section = run.update_weather(tmp_path, TODAY)
+    forecasts = run.load_forecasts(tmp_path)
+    assert forecasts[TODAY.isoformat()][2] is True
+    assert TODAY.isoformat() not in [r["date"] for r in section["losses"]]
+    assert section["losses"] and not any(r["issued"] for r in section["losses"])
+    assert forecasts[TODAY.isoformat()][0].min() >= 0 and forecasts[TODAY.isoformat()][0].max() <= 100
+
+
+def test_a_rerun_keeps_the_first_forecast_of_the_day(tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch, "weather", lambda past: hourly(past))
+    run.update_weather(tmp_path, TODAY)
+    first = run.load_forecasts(tmp_path)[TODAY.isoformat()][0].copy()
+    real = run.weather.predict
+    monkeypatch.setattr(run.weather, "predict", lambda values, day: (real(values, day)[0] + 1, values[:day].mean(axis=0)))
+    run.update_weather(tmp_path, TODAY)
+    assert np.array_equal(run.load_forecasts(tmp_path)[TODAY.isoformat()][0], first)
+
+
+def test_a_stored_day_is_never_replayed(tmp_path, monkeypatch):
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(25, 0, -1)]
+    history = {d: (field(50), field(0)) for d in days}
+    forecasts = {days[-1]: (field(1), field(2), True)}
+    run.keep_forecasts(forecasts, days, history, TODAY)
+    assert forecasts[days[-1]][0][0, 0] == 1 and forecasts[days[-1]][2] is True
+    assert forecasts[days[-2]][2] is False
+
+
+def test_a_replay_does_not_see_its_own_day_or_later():
+    rng = np.random.default_rng(1)
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(25, 0, -1)]
+    history = {d: (rng.uniform(0, 100, SHAPE), rng.uniform(-20, 30, SHAPE)) for d in days}
+    plain = {}
+    run.keep_forecasts(plain, days, history, TODAY)
+    changed = dict(history, **{d: (field(100), field(30)) for d in days[-3:]})
+    other = {}
+    run.keep_forecasts(other, days, changed, TODAY)
+    assert np.array_equal(plain[days[-3]][0], other[days[-3]][0])
+    assert not np.array_equal(plain[days[-2]][0], other[days[-2]][0])
+
+
+def test_forecasts_round_trip_through_the_data_directory(tmp_path):
+    run.save_forecasts(tmp_path, {"2026-11-02": (field(60), field(2), True), "2026-11-01": (field(10), field(3), False)})
+    saved = run.load_forecasts(tmp_path)
+    assert sorted(saved) == ["2026-11-01", "2026-11-02"]
+    assert saved["2026-11-02"][2] is True and saved["2026-11-01"][2] is False
+    assert saved["2026-11-01"][0][0, 0] == 10 and saved["2026-11-01"][1][0, 0] == 3
+    assert not list(tmp_path.glob("*.tmp*"))
+
+
+def test_tomorrow_scores_todays_issued_forecast(tmp_path, monkeypatch):
+    def from_day(day):
+        def weather_on(past):
+            start = np.datetime64(day - timedelta(days=past), "h")
+            stamps = start + np.arange((past + fetch.FORECAST_DAYS) * 24)
+            rng = np.random.default_rng(past)
+            return stamps, {name: rng.uniform(0, 50, (stamps.size, *SHAPE)).astype(np.float32) for name in ("cloud", "temp", "precip")}
+        return weather_on
+    monkeypatch.setattr(fetch, "weather", from_day(TODAY))
+    run.update_weather(tmp_path, TODAY)
+    issued = run.load_forecasts(tmp_path)[TODAY.isoformat()]
+    next_day = TODAY + timedelta(days=1)
+    monkeypatch.setattr(fetch, "weather", from_day(next_day))
+    last = run.update_weather(tmp_path, next_day)["losses"][-1]
+    assert last["date"] == TODAY.isoformat() and last["issued"] is True
+    actual = run.load_history(tmp_path)[TODAY.isoformat()][0]
+    assert last["cloud"]["model"] == round(run.weather.mse(actual, issued[0]), 1)

@@ -115,6 +115,11 @@ def mae(a, b):
     return float((np.abs(a - b) * AREA).sum() / (AREA.sum() * a.shape[1]))
 
 
+def mse(a, b):
+    """Mean squared error with the same area weights, which is the data term the ridge minimises."""
+    return float(((a - b) ** 2 * AREA).sum() / (AREA.sum() * a.shape[1]))
+
+
 def score(actual, forecast, persistence, climatology):
     return {
         "model": round(mae(actual, forecast), 2),
