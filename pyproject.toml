@@ -8,6 +8,10 @@ dependencies = ["numpy>=2,<3", "scipy>=1.14,<2", "sgp4>=2.24,<3"]
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 
+[tool.pytest.ini_options]
+# research/ needs torch and pyarrow, which the package and its CI job do not install.
+testpaths = ["tests"]
+
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
