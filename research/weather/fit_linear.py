@@ -51,7 +51,7 @@ def normal_equations(frames: Frames, days: np.ndarray, spec: Spec, radius: int, 
         day = torch.from_numpy(part)
         inputs, base = frames.batch(day)
         x = stencil(inputs[:, :spec.dynamic], radius).double()
-        y = ((frames.truth(day) - base) / frames.cloud_std).reshape(len(part), -1).double()
+        y = ((frames.truth(day) - base) / frames.target_std).reshape(len(part), -1).double()
         for g in range(count):
             cells = index == g
             one = x[:, cells].reshape(-1, features)
@@ -79,7 +79,7 @@ def validation(frames: Frames, days: np.ndarray, weights: torch.Tensor, group: n
     for part in np.array_split(days, max(1, len(days) // 128)):
         day = torch.from_numpy(part)
         inputs, base = frames.batch(day)
-        total += float(weighted(apply(inputs, base, weights, index, spec, radius, frames.cloud_std).clamp(0, 100), frames.truth(day)).sum())
+        total += float(weighted(apply(inputs, base, weights, index, spec, radius, frames.target_std).clamp(0, 100), frames.truth(day)).sum())
     return total / len(days)
 
 

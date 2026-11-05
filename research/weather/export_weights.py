@@ -1,7 +1,8 @@
 """Saves a trained network and its scales as the numpy file the daily job loads.
 
-usage: export_weights.py OUT.npz NET.pt [float16|float32]
+usage: export_weights.py OUT.npz NET.pt [float16|float32] [--layers]
 Layer weights take the given type. Scales stay float32, because pressure near 1000 hPa needs the digits.
+--layers leaves the scales out, for a network that reads them from the cloud file: they are the same numbers.
 """
 from __future__ import annotations
 
@@ -15,9 +16,12 @@ from features import LATS
 VARIABLES = ("cloud", "temp", "precip", "pressure", "u", "v", "water")
 
 
-def export(out: str, path: str, kind: str = "float16") -> None:
+def export(out: str, path: str, kind: str = "float16", layers: bool = False) -> None:
     saved = torch.load(path, map_location="cpu", weights_only=False)
     arrays = {name: value.numpy().astype(kind) for name, value in saved["state"].items()}
+    if layers:
+        np.savez_compressed(out, **arrays)
+        return
     stats = saved["stats"]
     for name in VARIABLES:
         arrays[f"clim_{name}"] = np.asarray(stats[f"clim_{name}"], dtype=np.float32)
@@ -28,4 +32,6 @@ def export(out: str, path: str, kind: str = "float16") -> None:
 
 
 if __name__ == "__main__":
-    export(*sys.argv[1:])
+    flags = sys.argv[1:]
+    only_layers = "--layers" in flags
+    export(*[f for f in flags if f != "--layers"], layers=only_layers)

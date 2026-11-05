@@ -239,7 +239,7 @@ def test_a_network_forecast_is_clipped_to_the_cover_range(monkeypatch):
     cloud, temp = (np.stack([field(v)] * 30) for v in (50, 5))
     steps = {d: np.zeros((7, 4, *SHAPE), dtype=np.float32) for d in days}
     monkeypatch.setattr(run.cloudnet, "predict", lambda held, when, saved: field(150))
-    found, _, net = run._forecast(cloud, temp, 30, TODAY, steps, None)
+    found, _, net, *_ = run._forecast(cloud, temp, 30, TODAY, steps, None)
     assert net is True and found.max() == 100
 
 
@@ -463,3 +463,85 @@ def test_a_later_run_retries_only_the_source_that_failed(tmp_path):
     assert run.run(tmp_path, today, updates) == 1
     assert run.run(tmp_path, today, updates) == 0
     assert calls == {"weather": 1, "satellites": 2}
+
+
+def _others(saved):
+    return {"temp": dict(saved), "pressure": dict(saved)}
+
+
+def test_the_networks_make_temperature_and_pressure_when_their_days_are_held(monkeypatch):
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    seen = []
+
+    def predict(held, when, saved, target="cloud"):
+        seen.append(target)
+        return field({"cloud": 40.0, "temp": 7.0, "pressure": 1012.34}[target])
+
+    monkeypatch.setattr(run.cloudnet, "predict", predict)
+    monkeypatch.setattr(run.cloudnet, "view", lambda steps, when: np.zeros(1))
+    history = {d: (field(90), field(0)) for d in days}
+    forecasts = {}
+    run.keep_forecasts(forecasts, days, history, {}, TODAY, {}, _others({}))
+    assert seen[:3] == ["cloud", "temp", "pressure"]
+    made = forecasts[TODAY.isoformat()]
+    assert made.net and made.temp_net and made.temp[0, 0] == 7.0 and made.pressure[0, 0] == 1012.34
+    today = run.weather_section(days, history, forecasts, TODAY)["today"]
+    assert today["networks"] == ["cloud", "temp", "pressure"]
+    assert len(today["pressure"]) == field(0).size and today["pressure"][0] == 1012.3
+    assert {p["temp"] for p in today["places"]} == {7.0}
+
+
+def test_without_their_days_temperature_comes_from_the_ridge_and_there_is_no_pressure(monkeypatch):
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    history = {d: (field(90), field(3)) for d in days}
+    forecasts = {}
+    run.keep_forecasts(forecasts, days, history, {}, TODAY, {}, _others({}))
+    made = forecasts[TODAY.isoformat()]
+    assert not made.net and not made.temp_net and made.pressure is None
+    today = run.weather_section(days, history, forecasts, TODAY)["today"]
+    assert today["networks"] == [] and "pressure" not in today
+
+
+def test_a_target_with_no_weights_file_keeps_the_ridge(monkeypatch, tmp_path):
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    monkeypatch.setattr(run.cloudnet, "predict", lambda held, when, saved, target="cloud": field(40.0))
+    monkeypatch.setattr(run.cloudnet, "view", lambda steps, when: np.zeros(1))
+    history = {d: (field(90), field(3)) for d in days}
+    forecasts = {}
+    missing = {"temp": tmp_path / "none.npz", "pressure": tmp_path / "none.npz"}
+    run.keep_forecasts(forecasts, days, history, {}, TODAY, {}, run.cloudnet.load_others({}, missing))
+    made = forecasts[TODAY.isoformat()]
+    assert made.net and not made.temp_net and made.pressure is None
+
+
+def test_an_other_network_keeps_its_own_layers_over_the_shared_scales(tmp_path):
+    saved = {"clim_temp": np.zeros(1, dtype=np.float32), "out.weight": np.zeros(1, dtype=np.float32)}
+    np.savez(tmp_path / "t.npz", **{"out.weight": np.ones(1)})
+    found = run.cloudnet.load_others(saved, {"temp": tmp_path / "t.npz"})["temp"]
+    assert found["out.weight"][0] == 1 and found["clim_temp"] is saved["clim_temp"]
+    assert saved["out.weight"][0] == 0
+
+
+def test_stored_forecasts_keep_pressure_and_read_older_files(tmp_path):
+    a, b = TODAY.isoformat(), (TODAY - timedelta(days=1)).isoformat()
+    forecasts = {a: run.Forecast(field(1), field(2), True, True, field(1000), True), b: (field(1), field(2), False, False)}
+    run.save_forecasts(tmp_path, forecasts)
+    back = run.load_forecasts(tmp_path)
+    assert back[a].pressure[0, 0] == 1000 and back[a].temp_net is True
+    assert back[b].pressure is None and back[b].temp_net is False
+    with np.load(tmp_path / "forecasts.npz") as saved:
+        np.savez(tmp_path / "forecasts.npz", **{k: saved[k] for k in ("days", "cloud", "temp", "issued", "net")})
+    assert run.load_forecasts(tmp_path)[a].pressure is None
+
+
+def test_the_pressure_loss_reads_the_mean_of_the_day_samples():
+    day, before = TODAY.isoformat(), (TODAY - timedelta(days=1)).isoformat()
+    def steps_of(value):
+        out = np.zeros((len(run.cloudnet.VARIABLES), 4, *SHAPE))
+        out[run.cloudnet.VARIABLES.index("pressure")] = value
+        return out
+    forecasts = {day: run.Forecast(field(1), field(2), True, True, field(1003), True)}
+    history = {day: (field(1), field(2)), before: (field(1), field(2))}
+    row = run.forecast_losses(forecasts, history, {day: steps_of(1000), before: steps_of(1004)})[0]
+    assert row["pressure"] == {"model": 9.0, "repeat": 16.0}
+    assert "pressure" not in run.forecast_losses(forecasts, history)[0]

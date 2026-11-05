@@ -13,7 +13,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[2]), str(Path(__file__).res
 from forecast import cloudnet, weather  # noqa: E402
 
 from common import STEPS_PER_DAY, daily  # noqa: E402
-from features import Spec, one_day  # noqa: E402
+from features import Spec, one_day, spec_of  # noqa: E402
 from fit_linear import apply  # noqa: E402
 from nets import UNet  # noqa: E402
 
@@ -43,16 +43,18 @@ class Climatology:
 
 class Net:
     def __init__(self, saved: dict):
-        self.spec = Spec(tuple(saved["spec"]["variables"]), saved["spec"]["steps"], saved["spec"]["lags"])
+        self.spec = spec_of(saved)
         self.stats = saved["stats"]
         self.net = UNet(self.spec.channels, saved["width"], saved["place"])
         self.net.load_state_dict(saved["state"])
         self.net.eval()
 
     @torch.no_grad()
-    def cloud(self, fields: dict, when) -> np.ndarray:
+    def forecast(self, fields: dict, when) -> np.ndarray:
         x, base = one_day(fields, when, self.spec, self.stats)
-        return (base + self.net(x) * float(self.stats["std_cloud"]))[0].numpy()
+        return (base + self.net(x) * float(self.stats[f"std_{self.spec.target}"]))[0].numpy()
+
+    cloud = forecast
 
 
 class Linear:

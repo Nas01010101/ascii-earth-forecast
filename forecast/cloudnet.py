@@ -1,4 +1,4 @@
-"""Forecasts a day's mean cloud cover with a U-Net, run with numpy in the daily job.
+"""Forecasts a day's mean cloud cover, temperature and pressure with one U-Net each, run with numpy in the daily job.
 
 The weights are trained offline on ERA5 (research/weather) and frozen here. A forecast reads the 30 days before
 its target, 6-hourly, so replaying a past day gives what would have been issued on it. The formulas match
@@ -12,6 +12,7 @@ import numpy as np
 from scipy.special import erf
 
 WEIGHTS = Path(__file__).with_name("cloud_weights.npz")
+OTHER_WEIGHTS = {name: Path(__file__).with_name(f"{name}_weights.npz") for name in ("temp", "pressure")}
 VARIABLES = ("cloud", "temp", "precip", "pressure", "u", "v", "water")
 STEPS_PER_DAY = 4
 HOURS_PER_STEP = 6
@@ -26,6 +27,15 @@ UP_BLOCKS = 3
 def load(path=WEIGHTS):
     with np.load(path) as saved:
         return {name: saved[name].astype(np.float32) for name in saved.files}
+
+
+def load_others(saved, files=None):
+    """The networks of the other targets, each its own layers over the scales of `saved`. No file means no network."""
+    found = {}
+    for name, path in (OTHER_WEIGHTS if files is None else files).items():
+        if Path(path).exists():
+            found[name] = {**saved, **load(path)}
+    return found
 
 
 def day_steps(hours, fields, day):
@@ -56,8 +66,8 @@ def _doy(when):
     return when.timetuple().tm_yday - 1
 
 
-def inputs(held, when, saved):
-    """(channels, lat, lon) and the base forecast in percent, as research/weather/features.py builds them."""
+def inputs(held, when, saved, target="cloud"):
+    """(channels, lat, lon) and the base forecast in the target's unit, as research/weather/features.py builds them."""
     start = when - timedelta(days=DAYS_NEEDED)
     doys = np.array([_doy(start + timedelta(days=d)) for d in range(DAYS_NEEDED)])
     days = {}
@@ -66,14 +76,16 @@ def inputs(held, when, saved):
         scaled = (held[k] - saved[f"clim_{name}"][np.repeat(doys, STEPS_PER_DAY)]) / saved[f"std_{name}"]
         days[name] = scaled.reshape(DAYS_NEEDED, STEPS_PER_DAY, *scaled.shape[1:]).mean(1)
         parts += [scaled[::-1][:STEPS_PER_DAY], days[name][::-1][:LAGS]]
-    trail = {n: days[n].mean(0, dtype=np.float64).astype(np.float32) for n in ("cloud", "temp")}
-    target = _doy(when)
-    mean = saved["clim_cloud"][target]
-    angle = 2 * np.pi * target / 366
+    trail = {n: days[n].mean(0, dtype=np.float64).astype(np.float32) for n in {"cloud", "temp", target}}
+    day = _doy(when)
+    mean = saved[f"clim_{target}"][day]
+    std = saved[f"std_{target}"]
+    centre = 0.0 if target == "cloud" else float(saved[f"clim_{target}"].mean())
+    angle = 2 * np.pi * day / 366
     shape = mean.shape
     extra = [trail["cloud"], trail["temp"], *saved["fixed"], np.full(shape, math.sin(angle)), np.full(shape, math.cos(angle)),
-             mean / saved["std_cloud"]]
-    return np.concatenate([*parts, np.stack(extra)]).astype(np.float32), mean + trail["cloud"] * saved["std_cloud"]
+             (mean - centre) / std]
+    return np.concatenate([*parts, np.stack(extra)]).astype(np.float32), mean + trail[target] * std
 
 
 def _gelu(x):
@@ -109,7 +121,7 @@ def _halve(x):
 
 
 def network(x, net):
-    """The change from the base forecast, in units of the cloud scale."""
+    """The change from the base forecast, in units of the target's scale."""
     x = np.concatenate([x, net["place"][0]])
     kept = []
     for k in range(DOWN_BLOCKS):
@@ -121,7 +133,7 @@ def network(x, net):
     return _conv(x, net["out.weight"], net["out.bias"])[0]
 
 
-def predict(held, when, saved):
-    """Mean cloud cover in percent for the target day, not yet clipped."""
-    x, base = inputs(held, when, saved)
-    return base + network(x, saved) * saved["std_cloud"]
+def predict(held, when, saved, target="cloud"):
+    """The target variable's daily mean in its own unit (cloud in percent, not yet clipped)."""
+    x, base = inputs(held, when, saved, target)
+    return base + network(x, saved) * saved[f"std_{target}"]

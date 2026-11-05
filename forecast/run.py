@@ -8,6 +8,7 @@ import json
 import os
 import struct
 import sys
+from collections import namedtuple
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +25,8 @@ MIN_HOURS = 18
 FRAME_HOURS = 3
 RAMP = " .:-=+*#%@"
 CLOUD_RANGE = (0, 100)
+# net: the network made the cloud. temp_net: the network made the temperature. pressure: None when no network made one.
+Forecast = namedtuple("Forecast", "cloud temp issued net pressure temp_net", defaults=(None, False))
 
 
 def write_atomic(path, data):
@@ -59,17 +62,26 @@ def load_forecasts(root):
         days, cloud, temp, issued = saved["days"], saved["cloud"], saved["temp"], saved["issued"]
         # Forecasts stored before the network have no flag, and all came from the ridge.
         net = saved["net"] if "net" in saved.files else np.zeros(len(days), dtype=bool)
-    return {str(d): (cloud[i], temp[i], bool(issued[i]), bool(net[i])) for i, d in enumerate(days)}
+        # Forecasts stored before the temperature and pressure networks have neither.
+        temp_net = saved["temp_net"] if "temp_net" in saved.files else np.zeros(len(days), dtype=bool)
+        pressure = saved["pressure"] if "pressure" in saved.files else np.full((len(days), 1, 1), np.nan)
+    return {str(d): Forecast(cloud[i], temp[i], bool(issued[i]), bool(net[i]),
+                             None if np.isnan(pressure[i]).all() else pressure[i], bool(temp_net[i]))
+            for i, d in enumerate(days)}
 
 
 def save_forecasts(root, forecasts):
     days = sorted(forecasts)
     temp = root / "forecasts.tmp.npz"
+    made = [Forecast(*forecasts[d]) for d in days]
+    empty = np.full(np.shape(made[0].cloud), np.nan)
     np.savez_compressed(temp, days=np.array(days),
                         cloud=np.stack([forecasts[d][0] for d in days]).astype(np.float32),
                         temp=np.stack([forecasts[d][1] for d in days]).astype(np.float32),
                         issued=np.array([forecasts[d][2] for d in days]),
-                        net=np.array([forecasts[d][3] for d in days]))
+                        net=np.array([forecasts[d][3] for d in days]),
+                        temp_net=np.array([f.temp_net for f in made]),
+                        pressure=np.stack([empty if f.pressure is None else f.pressure for f in made]).astype(np.float32))
     os.replace(temp, root / "forecasts.npz")
 
 
@@ -178,22 +190,26 @@ def picture(field, top):
     return ["".join(RAMP[i] for i in row) for row in index[::-1]]
 
 
-def _forecast(cloud, temp, target, when, steps, saved):
-    """Forecasts a day from the days before it, as (cloud, temp, whether the network made the cloud).
+def _forecast(cloud, temp, target, when, steps, saved, others=None):
+    """Forecasts a day from the days before it, as (cloud, temp, cloud by network, pressure or None, temp by network).
 
-    The network needs all 30 days of 6-hourly steps. When any is missing the cloud comes from the ridge, so a
-    forecast is still kept, and the flag says which model made it. Cover outside 0..100 cannot happen.
+    The networks need all 30 days of 6-hourly steps. When any is missing cloud and temperature come from the ridge, so
+    a forecast is still kept, the flags say which model made it, and there is no pressure. `others` holds the networks
+    of the other targets, and a target without one takes the same fallback. Cover outside 0..100 cannot happen.
     """
+    others = others or {}
     held = cloudnet.view(steps, when)
     if held is None:
-        print(f"::warning::weather: 6-hourly days missing before {when}, cloud from the ridge", file=sys.stderr)
+        print(f"::warning::weather: 6-hourly days missing before {when}, ridge forecasts only", file=sys.stderr)
         found = weather.predict(cloud, target)[0]
     else:
         found = cloudnet.predict(held, when, saved)
-    return np.clip(found, *CLOUD_RANGE), weather.predict(temp, target)[0], held is not None
+    by_net = {name: cloudnet.predict(held, when, net, name) for name, net in others.items()} if held is not None else {}
+    made_temp = by_net["temp"] if "temp" in by_net else weather.predict(temp, target)[0]
+    return np.clip(found, *CLOUD_RANGE), made_temp, held is not None, by_net.get("pressure"), "temp" in by_net
 
 
-def keep_forecasts(forecasts, days, history, steps, today, saved):
+def keep_forecasts(forecasts, days, history, steps, today, saved, others=None):
     """Stores today's forecast as issued and replays the recent days that have none. No entry is rewritten.
 
     A replay runs the same code on the stored days before its target, and stays flagged as not issued.
@@ -201,16 +217,22 @@ def keep_forecasts(forecasts, days, history, steps, today, saved):
     cloud = np.stack([history[d][0] for d in days])
     temp = np.stack([history[d][1] for d in days])
     if today.isoformat() not in forecasts:
-        made = _forecast(cloud, temp, len(days), today, steps, saved)
-        forecasts[today.isoformat()] = (made[0], made[1], True, made[2])
+        made = _forecast(cloud, temp, len(days), today, steps, saved, others)
+        forecasts[today.isoformat()] = Forecast(made[0], made[1], True, made[2], made[3], made[4])
     for target in range(max(len(days) - LOSS_DAYS, weather.MIN_TRAIN_DAYS + 3), len(days)):
         if days[target] not in forecasts:
-            made = _forecast(cloud, temp, target, date.fromisoformat(days[target]), steps, saved)
-            forecasts[days[target]] = (made[0], made[1], False, made[2])
+            made = _forecast(cloud, temp, target, date.fromisoformat(days[target]), steps, saved, others)
+            forecasts[days[target]] = Forecast(made[0], made[1], False, made[2], made[3], made[4])
 
 
-def forecast_losses(forecasts, history):
+def _pressure_of_day(steps, day):
+    """A day's pressure as the mean of its 4 samples, the truth the network was scored on, or None if not held."""
+    return steps[day][cloudnet.VARIABLES.index("pressure")].mean(0) if day in steps else None
+
+
+def forecast_losses(forecasts, history, steps=None):
     """Area-weighted squared error of each stored forecast whose day has finished, and of repeating the day before."""
+    steps = steps or {}
     rows = []
     for day in sorted(set(forecasts) & set(history))[-LOSS_DAYS:]:
         before = history.get((date.fromisoformat(day) - timedelta(days=1)).isoformat())
@@ -218,13 +240,21 @@ def forecast_losses(forecasts, history):
         for i, name in enumerate(("cloud", "temp")):
             row[name] = {"model": round(weather.mse(history[day][i], forecasts[day][i]), 1),
                          "repeat": round(weather.mse(history[day][i], before[i]), 1) if before else None}
+        made = Forecast(*forecasts[day])
+        truth = _pressure_of_day(steps, day)
+        if made.pressure is not None and truth is not None:
+            earlier = _pressure_of_day(steps, (date.fromisoformat(day) - timedelta(days=1)).isoformat())
+            row["pressure"] = {"model": round(weather.mse(truth, made.pressure), 1),
+                               "repeat": round(weather.mse(truth, earlier), 1) if earlier is not None else None}
         rows.append(row)
     return rows
 
 
 def weather_section(days, history, forecasts, today):
-    cloud, temp, _, net = forecasts[today.isoformat()]
-    return {
+    made = Forecast(*forecasts[today.isoformat()])
+    cloud, temp, net = made.cloud, made.temp, made.net
+    networks = [name for name, by_net in (("cloud", net), ("temp", made.temp_net), ("pressure", made.pressure is not None)) if by_net]
+    section = {
         "train_days": len(days),
         "today": {
             "date": today.isoformat(),
@@ -234,9 +264,14 @@ def weather_section(days, history, forecasts, today):
             # Whole percent and whole degrees, south to north and west to east, for the viewer's map.
             "cloud": np.clip(cloud, *CLOUD_RANGE).round().astype(int).ravel().tolist(),
             "temp": np.asarray(temp).round().astype(int).ravel().tolist(),
+            "networks": networks,
         },
         "last_scored": {"date": days[-1], "actual": picture(history[days[-1]][0], 100)},
     }
+    if made.pressure is not None:
+        # A tenth of a hPa keeps the viewer's isobars from stepping.
+        section["today"]["pressure"] = np.asarray(made.pressure, dtype=np.float64).round(1).ravel().tolist()
+    return section
 
 
 def planet_frames(hours, fields, today):
@@ -267,9 +302,10 @@ def update_weather(root, today):
     if len(days) <= weather.MIN_TRAIN_DAYS + 3:
         raise fetch.SourceError(f"weather: {len(days)} consecutive days is too few to forecast")
     forecasts = load_forecasts(root)
-    keep_forecasts(forecasts, days, history, steps, today, cloudnet.load())
+    saved = cloudnet.load()
+    keep_forecasts(forecasts, days, history, steps, today, saved, cloudnet.load_others(saved))
     save_forecasts(root, forecasts)
-    return {**weather_section(days, history, forecasts, today), "losses": forecast_losses(forecasts, history)}
+    return {**weather_section(days, history, forecasts, today), "losses": forecast_losses(forecasts, history, steps)}
 
 
 def stored_losses(root):

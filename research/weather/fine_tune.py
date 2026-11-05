@@ -1,4 +1,4 @@
-"""Fine-tunes a network trained on ERA5 on Open-Meteo days, against 24-hour mean cloud.
+"""Fine-tunes a network trained on ERA5 on Open-Meteo days, against the 24-hour mean where the file holds one.
 
 usage: fine_tune.py NET.pt DEV.npz FIRST LAST SELECT_FIRST SELECT_LAST OUT.pt --lr 1e-4 --epochs 20 --pull 1 --part all
 Keeps the epoch with the lowest loss on the select days. `pull` is a penalty on the squared distance from the starting
@@ -12,7 +12,7 @@ from datetime import date
 import numpy as np
 import torch
 
-from features import Frames, Spec
+from features import Frames, spec_of
 from nets import UNet
 from openmeteo_split import FIELD_NAMES
 from train_net import weighted
@@ -31,14 +31,14 @@ def trainable(net: UNet, part: str) -> list:
 
 def forecast(net: UNet, frames: Frames, days: np.ndarray) -> torch.Tensor:
     x, base = frames.batch(torch.from_numpy(days))
-    return base + net(x) * frames.cloud_std
+    return base + net(x) * frames.target_std
 
 
 @torch.no_grad()
 def loss_on(net: UNet, frames: Frames, truth: torch.Tensor, days: np.ndarray) -> float:
     net.eval()
     index = torch.from_numpy(days).to(truth.device)
-    return float(weighted(forecast(net, frames, days).clamp(0, 100), truth[index]).mean())
+    return float(weighted(frames.limited(forecast(net, frames, days)), truth[index]).mean())
 
 
 def tune(net: UNet, frames: Frames, truth: torch.Tensor, fit_days: np.ndarray, select_days: np.ndarray, args) -> tuple:
@@ -80,12 +80,14 @@ def main() -> None:
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     saved = torch.load(args.net, map_location="cpu", weights_only=False)
-    spec = Spec(tuple(saved["spec"]["variables"]), saved["spec"]["steps"], saved["spec"]["lags"])
+    spec = spec_of(saved)
     held = np.load(args.dev)
     first = date.fromisoformat(str(held["first_date"]))
     index = lambda name: (date.fromisoformat(name) - first).days
     frames = Frames({name: held[name] for name in FIELD_NAMES}, first, spec, saved["stats"], device)
-    truth = torch.from_numpy(held["cloud_day"].astype(np.float32)).to(device)
+    # Pressure has no 24-hour mean on file and hardly moves within a day, so its truth is the 4 samples' mean.
+    name = f"{spec.target}_day"
+    truth = torch.from_numpy(held[name].astype(np.float32)).to(device) if name in held.files else frames.truth(torch.arange(len(held["cloud_day"])))
     net = UNet(spec.channels, saved["width"], saved["place"]).to(device)
     net.load_state_dict(saved["state"])
     fit_days = np.arange(index(args.first), index(args.last) + 1)

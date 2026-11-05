@@ -1,6 +1,6 @@
 """Trains a U-Net on the training years, stopping at the best validation epoch.
 
-usage: train_net.py ERA5_DIR STATS.npz VAL.npz OUT.pt OUT.csv --seed N --vars cloud,temp --steps 0 --lags 3
+usage: train_net.py ERA5_DIR STATS.npz VAL.npz OUT.pt OUT.csv --seed N --vars cloud,temp --steps 0 --lags 3 --target cloud
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ AREA = torch.from_numpy(np.cos(np.radians(LATS)).astype(np.float32))[:, None]
 
 
 def weighted(pred: torch.Tensor, truth: torch.Tensor) -> torch.Tensor:
-    """Per-pixel squared error with the judge's area weights, in percent squared."""
+    """Per-pixel squared error with the judge's area weights, in the target's unit squared."""
     area = AREA.to(pred.device)
     return (((pred - truth) ** 2) * area).sum((1, 2)) / (area.sum() * pred.shape[-1])
 
@@ -34,7 +34,7 @@ def loss_of(net, frames: Frames, days: np.ndarray, size: int = 256) -> float:
     for part in np.array_split(days, max(1, len(days) // size)):
         index = torch.from_numpy(part)
         x, base = frames.batch(index)
-        total += float(weighted((base + net(x) * frames.cloud_std).clamp(0, 100), frames.truth(index)).sum())
+        total += float(weighted(frames.limited(base + net(x) * frames.target_std), frames.truth(index)).sum())
     return total / len(days)
 
 
@@ -53,10 +53,10 @@ def train(frames: Frames, val: Frames, val_days: np.ndarray, spec: Spec, args, d
         for k in range(len(days) // args.batch):
             index = torch.from_numpy(order[k * args.batch: (k + 1) * args.batch])
             x, base = frames.batch(index)
-            loss = weighted(base + net(x) * frames.cloud_std, frames.truth(index)).mean()
+            loss = weighted(base + net(x) * frames.target_std, frames.truth(index)).mean()
             optimiser.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 10 * frames.cloud_std)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 10 * frames.target_std)
             optimiser.step()
             schedule.step()
             seen += loss.item()
@@ -76,6 +76,7 @@ def main() -> None:
     parser.add_argument("--vars", default="cloud,temp")
     parser.add_argument("--steps", type=int, default=0)
     parser.add_argument("--lags", type=int, default=3)
+    parser.add_argument("--target", default="cloud", choices=FIELDS)
     parser.add_argument("--width", type=int, default=32)
     parser.add_argument("--place", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=30)
@@ -86,9 +87,9 @@ def main() -> None:
     parser.add_argument("--last-year", type=int, default=LAST_TRAIN)
     args = parser.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    spec = Spec(tuple(args.vars.split(",")), args.steps, args.lags)
+    spec = Spec(tuple(args.vars.split(",")), args.steps, args.lags, args.target)
     stats = dict(np.load(args.stats))
-    names = set(spec.variables) | {"cloud", "temp"}
+    names = set(spec.variables) | {"cloud", "temp", spec.target}
     years = range(args.first_year, args.last_year + 1)
     fields = {n: np.concatenate([load_year(args.era5, n, y) for y in years]) for n in names}
     frames = Frames(fields, date(args.first_year, 1, 1), spec, stats, device)

@@ -103,3 +103,47 @@ def test_a_day_with_missing_hours_is_refused():
     assert cloudnet.day_steps(hours, fields, date(2026, 3, 2)) is not None
     assert cloudnet.day_steps(hours[:24 + 18], fields, date(2026, 3, 2)) is None  # the 18 UTC step is not held
     assert cloudnet.view({(WHEN - timedelta(days=1)).isoformat(): np.zeros((7, 4, 2, 2))}, WHEN) is None
+
+
+@pytest.mark.parametrize("target", ["temp", "pressure"])
+def test_a_target_forecast_matches_the_torch_network(tmp_path, target):
+    torch.manual_seed(1)
+    rng = np.random.default_rng(1)
+    spec = Spec(cloudnet.VARIABLES, cloudnet.STEPS_PER_DAY, cloudnet.LAGS, target)
+    net = UNet(spec.channels, 8, 4)
+    torch.nn.init.normal_(net.out.weight, std=.1)
+    torch.nn.init.normal_(net.place, std=.5)
+    stats = scales(rng)
+    stats[f"clim_{target}"] = stats[f"clim_{target}"] + 1000  # a pressure-sized mean must not swamp the input
+    path = tmp_path / "net.pt"
+    torch.save({"kind": "net", "state": net.state_dict(), "stats": stats, "width": 8, "place": 4,
+                "spec": {"variables": spec.variables, "steps": spec.steps, "lags": spec.lags, "target": target}}, path)
+    out = tmp_path / "w.npz"
+    export(out, path, "float32")
+    weights = dict(np.load(out))
+    steps = held()
+    torch_x, torch_base = one_day(as_fields(steps), WHEN, spec, stats)
+    x, base = cloudnet.inputs(steps, WHEN, weights, target)
+    assert np.allclose(x, torch_x[0].numpy(), atol=1e-3)
+    assert np.allclose(base, torch_base[0].numpy(), atol=1e-2)
+    assert abs(x[-1]).max() < 20
+    got = cloudnet.predict(steps, WHEN, weights, target)
+    assert np.allclose(got, candidate.load(str(path)).forecast(as_fields(steps), WHEN), atol=2e-2)
+
+
+def test_a_layers_file_over_the_cloud_scales_gives_the_same_forecast(tmp_path):
+    torch.manual_seed(2)
+    spec = Spec(cloudnet.VARIABLES, cloudnet.STEPS_PER_DAY, cloudnet.LAGS, "pressure")
+    net = UNet(spec.channels, 8, 4)
+    torch.nn.init.normal_(net.out.weight, std=.1)
+    path, whole, layers = tmp_path / "net.pt", tmp_path / "whole.npz", tmp_path / "layers.npz"
+    torch.save({"kind": "net", "state": net.state_dict(), "stats": scales(np.random.default_rng(2)), "width": 8, "place": 4,
+                "spec": {"variables": spec.variables, "steps": spec.steps, "lags": spec.lags, "target": "pressure"}}, path)
+    export(whole, path, "float32")
+    export(layers, path, "float32", layers=True)
+    assert not any(name.startswith(("clim_", "std_")) or name == "fixed" for name in cloudnet.load(layers))
+    # The cloud file brings the scales, and its own layers must give way to the pressure network's.
+    cloud_file = {**cloudnet.load(whole), "out.weight": np.zeros_like(cloudnet.load(whole)["out.weight"])}
+    joined = cloudnet.load_others(cloud_file, {"pressure": layers})["pressure"]
+    steps = held()
+    assert np.array_equal(cloudnet.predict(steps, WHEN, joined, "pressure"), cloudnet.predict(steps, WHEN, cloudnet.load(whole), "pressure"))

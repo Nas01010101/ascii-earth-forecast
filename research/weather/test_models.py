@@ -12,7 +12,7 @@ import nets
 import score
 import train_net
 from common import FIELDS, STEPS_PER_DAY, daily
-from features import Frames, Spec, TRAIL_DAYS, one_day
+from features import Frames, Spec, TRAIL_DAYS, one_day, spec_of
 
 DAYS = 400
 START = date(2001, 1, 1)
@@ -163,3 +163,69 @@ def test_a_climatology_file_runs_through_the_judge_as_the_base_forecast(tmp_path
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def _varied(seed=3):
+    """Every field different, so a target reading the wrong field cannot pass."""
+    rng = np.random.default_rng(seed)
+    return {n: (50 + k + rng.normal(0, 5, (60 * STEPS_PER_DAY, 24, 48))).astype(np.float32) for k, n in enumerate(FIELDS)}
+
+
+def _scales():
+    out = stats()
+    for k, n in enumerate(FIELDS):
+        out[f"clim_{n}"] = np.full((366, 24, 48), 40.0 + 2 * k, np.float32)
+        out[f"std_{n}"] = np.float32(3.0 + k)
+    return out
+
+
+@pytest.mark.parametrize("target", ["temp", "pressure"])
+def test_a_target_sets_the_base_truth_and_last_channel(target):
+    fields, scales, day = _varied(), _scales(), TRAIL_DAYS + 5
+    spec = Spec(("cloud", "temp"), 4, 3, target)
+    frames = Frames(fields, START, spec, scales)
+    x, base = frames.batch(torch.tensor([day]))
+    std = float(scales[f"std_{target}"])
+    means = daily(fields[target])
+    want_base = means[day - TRAIL_DAYS: day].mean(0)
+    assert np.allclose(base[0].numpy(), want_base, atol=1e-2)
+    assert np.allclose(frames.truth(torch.tensor([day]))[0].numpy(), means[day], atol=1e-2)
+    assert x.shape[1] == spec.channels
+    assert np.allclose(x[0, -1].numpy(), (scales[f"clim_{target}"][0] - scales[f"clim_{target}"].mean()) / std)
+
+
+def test_a_cloud_target_keeps_its_uncentred_last_input():
+    fields, scales = _varied(), _scales()
+    x, _ = Frames(fields, START, Spec(), scales).batch(torch.tensor([40]))
+    assert np.allclose(x[0, -1].numpy(), scales["clim_cloud"][0] / float(scales["std_cloud"]))
+
+
+def test_a_pressure_forecast_works_when_pressure_is_not_an_input():
+    fields, scales = _varied(), _scales()
+    spec = Spec(("cloud", "temp"), 4, 3, "pressure")
+    view = {n: f[:50 * STEPS_PER_DAY] for n, f in fields.items()}
+    x, base = Frames(fields, START, spec, scales).batch(torch.tensor([50]))
+    y, other = one_day(view, START + timedelta(days=50), spec, scales)
+    assert torch.allclose(x, y, atol=1e-4) and torch.allclose(base, other, atol=1e-3)
+
+
+def test_only_cloud_is_limited_to_its_range():
+    fields, scales = _varied(), _scales()
+    wide = torch.tensor([-50.0, 1000.0])
+    assert Frames(fields, START, Spec(), scales).limited(wide).tolist() == [0.0, 100.0]
+    assert Frames(fields, START, Spec(target="pressure"), scales).limited(wide).tolist() == [-50.0, 1000.0]
+
+
+def test_a_checkpoint_saved_before_targets_existed_forecasts_cloud():
+    old = {"spec": {"variables": ("cloud", "temp"), "steps": 4, "lags": 3}}
+    assert spec_of(old) == Spec(("cloud", "temp"), 4, 3, "cloud")
+    assert spec_of({"spec": {**old["spec"], "target": "temp"}}).target == "temp"
+
+
+def test_a_cloud_target_keeps_the_earlier_batch():
+    fields, scales = _varied(), _scales()
+    spec = Spec(("cloud", "temp"), 4, 3)
+    x, base = Frames(fields, START, spec, scales).batch(torch.tensor([40]))
+    means = daily(fields["cloud"])[10:40].mean(0)
+    assert np.allclose(base[0].numpy(), means, atol=1e-2)
+    assert x.shape[1] == len(spec.variables) * 7 + 2 + 7
