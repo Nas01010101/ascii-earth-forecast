@@ -6,9 +6,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from build_samples import FEATURES, HORIZONS, TARGETS, object_samples
-from data import load_folder, metric_weights
+from data import day, load_folder, metric_weights
 from dense_eval import in_steps
 from dense_samples import EDGES, dense_targets, tolerance_of
+from final_fit import training_rows
 from train_net import train_rows
 
 WEATHER = {day: (150.0, 150.0, 10.0) for day in range(-7306 + 25990, -7306 + 27000)}
@@ -74,13 +75,29 @@ def test_metric_weights_keep_sub_day_buckets_apart():
     assert np.allclose(w[2] / w[3], 10)
 
 
-def table_file(path, norad, epochs):
+def table_file(path, norad, epochs, fill=0.0):
     n = len(epochs)
     cols = {"norad": pa.array(np.full(n, norad, np.int32)), "epoch": pa.array(np.asarray(epochs, np.float64)),
             "horizon": pa.array(np.full(n, 1.0, np.float32)), "dt": pa.array(np.full(n, 1.0, np.float32)), "radius": pa.array(np.full(n, 7000.0, np.float32))}
     for c in TARGETS + FEATURES:
-        cols[c] = pa.array(np.zeros(n, np.float32))
+        cols[c] = pa.array(np.full(n, fill, np.float32))
     pq.write_table(pa.table(cols), path)
+
+
+def test_the_dense_refit_stops_at_its_last_year_and_hides_history(tmp_path):
+    end = day(2025)
+    table_file(tmp_path / "shard_00.parquet", 64, np.linspace(end - 200, end + 100, 3000), fill=30.0)  # 30 days old: hidden at any days held
+    args, rows = training_rows(str(tmp_path), seed=0, last_year=2024, dense=True)
+    assert not args.fixed_dt
+    assert len(rows["epoch"]) and (rows["epoch"] + rows["dt"] < end).all()
+    assert 0.12 < np.isnan(rows["x"][:, FEATURES.index("age_1")]).mean() < 0.18
+
+
+def test_the_shipped_recipe_keeps_nominal_horizons_and_all_history(tmp_path):
+    table_file(tmp_path / "shard_00.parquet", 64, np.linspace(day(2025), day(2025) + 100, 300), fill=30.0)
+    args, rows = training_rows(str(tmp_path), seed=0, last_year=2025, dense=False)
+    assert args.fixed_dt
+    assert np.isfinite(rows["x"]).all()
 
 
 def test_load_folder_thins_by_rate(tmp_path):
