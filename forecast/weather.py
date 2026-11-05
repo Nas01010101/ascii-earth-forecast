@@ -1,4 +1,5 @@
-"""Next-day forecast of daily mean cloud cover and temperature: one ridge regression per latitude band.
+"""Next-day forecast of daily mean temperature, and of cloud cover when the network cannot run: one ridge
+regression per latitude band.
 
 Each cell is predicted from its own last three days and its four neighbours yesterday,
 all as departures from that cell's mean over the earlier days. Nothing from the target
@@ -13,8 +14,6 @@ RIDGE = 1.0
 FEATURES = ("yesterday", "2 days ago", "3 days ago", "north", "south", "east", "west")
 # Tropics, mid-latitudes and poles have different prevailing winds, so each gets its own weights.
 BANDS = (np.abs(LATS) < 30, (np.abs(LATS) >= 30) & (np.abs(LATS) < 60), np.abs(LATS) >= 60)
-BAND_NAMES = ("tropics", "mid-latitudes", "poles")
-# One fixed cell per band, so the page can walk a real number through the weights.
 CELLS = (("near Singapore", 3.75, 101.25), ("near Montreal", 48.75, -71.25), ("near Tromso", 71.25, 18.75))
 AREA = np.cos(np.radians(LATS))[:, None]
 
@@ -44,7 +43,7 @@ def training_rows(anomaly, band):
 
 
 def fit(series, day):
-    """Fits series[:day]. Returns (cell means, departures, per band {weights, loss, rmse}).
+    """Fits series[:day]. Returns (cell means, departures, per band {weights, loss}).
 
     Each band minimises sum(area * (y - x @ w)^2) + RIDGE * w @ w, which _solve does in one step.
     """
@@ -56,8 +55,7 @@ def fit(series, day):
     for band in BANDS:
         x, y, area = training_rows(anomaly, band)
         w = _solve(x, y, area)
-        squared = float((area * (y - x @ w) ** 2).sum())
-        fits.append({"weights": w, "loss": squared + RIDGE * float(w @ w), "rmse": (squared / float(area.sum())) ** 0.5})
+        fits.append({"weights": w, "loss": float((area * (y - x @ w) ** 2).sum()) + RIDGE * float(w @ w)})
     return climatology, anomaly, fits
 
 
@@ -81,48 +79,6 @@ def at_places(cloud, temp):
             for place, lat, lon in CELLS]
 
 
-def explain(series, day, limits):
-    """The fit behind one forecast, per band: weights, training loss and one worked cell."""
-    climatology, anomaly, fits = fit(series, day)
-    inputs = _inputs(anomaly, day)
-    bands = []
-    for name, fitted, (place, lat, lon) in zip(BAND_NAMES, fits, CELLS):
-        i, j = _cell(lat, lon)
-        x, w = inputs[:, i, j], fitted["weights"]
-        raw = float(climatology[i, j] + x @ w)
-        predicted = float(np.clip(raw, *limits))
-        actual = float(series[day, i, j])
-        bands.append({
-            "name": name,
-            "weights": [round(float(v), 3) for v in w],
-            "loss": round(fitted["loss"]),
-            "rmse": round(fitted["rmse"], 2),
-            "cell": {
-                "place": place, "lat": lat, "lon": lon,
-                "inputs": [round(float(v), 1) for v in x],
-                "mean": round(float(climatology[i, j]), 1),
-                "change": round(float(x @ w), 1),
-                "predicted": round(predicted, 1),
-                "actual": round(actual, 1),
-                "error": round(abs(predicted - actual), 1),
-            },
-        })
-    return bands
-
-
-def mae(a, b):
-    """Mean absolute error, weighted by the area each latitude row covers."""
-    return float((np.abs(a - b) * AREA).sum() / (AREA.sum() * a.shape[1]))
-
-
 def mse(a, b):
-    """Mean squared error with the same area weights, which is the data term the ridge minimises."""
+    """Mean squared error with area weights, the data term the ridge and the network both minimise."""
     return float(((a - b) ** 2 * AREA).sum() / (AREA.sum() * a.shape[1]))
-
-
-def score(actual, forecast, persistence, climatology):
-    return {
-        "model": round(mae(actual, forecast), 2),
-        "persistence": round(mae(actual, persistence), 2),
-        "trailing_mean": round(mae(actual, climatology), 2),
-    }

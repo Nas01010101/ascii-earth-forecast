@@ -30,23 +30,13 @@ def test_model_beats_baselines_when_there_is_memory():
     series = ar_series()
     day = 35
     forecast, trailing = weather.predict(series, day)
-    scores = weather.score(series[day], forecast, series[day - 1], trailing)
-    assert scores["model"] < scores["persistence"]
-    assert scores["model"] < scores["trailing_mean"]
+    assert weather.mse(series[day], forecast) < weather.mse(series[day], series[day - 1])
+    assert weather.mse(series[day], forecast) < weather.mse(series[day], trailing)
 
 
 def test_refuses_too_little_history():
     with pytest.raises(ValueError):
         weather.predict(ar_series(days=16), 16)
-
-
-def test_mae_weights_by_area():
-    a = np.zeros(SHAPE)
-    polar = a.copy()
-    polar[0] = 10
-    equator = a.copy()
-    equator[len(LATS) // 2] = 10
-    assert weather.mae(a, polar) < weather.mae(a, equator)
 
 
 def test_published_weights_minimise_the_published_loss():
@@ -59,24 +49,6 @@ def test_published_weights_minimise_the_published_loss():
     for nudge in np.eye(len(w)) * 1e-3:
         assert objective(w) < objective(w + nudge)
         assert objective(w) < objective(w - nudge)
-
-
-def test_worked_cells_match_the_forecast():
-    series = ar_series()
-    day = 30
-    forecast, _ = weather.predict(series, day)
-    for band in weather.explain(series, day, (0, 100)):
-        cell = band["cell"]
-        i, j = np.abs(LATS - cell["lat"]).argmin(), np.abs(LONS - cell["lon"]).argmin()
-        assert cell["predicted"] == pytest.approx(np.clip(forecast[i, j], 0, 100), abs=0.051)
-        assert cell["actual"] == pytest.approx(series[day, i, j], abs=0.051)
-        assert cell["mean"] + cell["change"] == pytest.approx(forecast[i, j], abs=0.11)
-        assert len(cell["inputs"]) == len(band["weights"]) == len(weather.FEATURES)
-
-
-def test_worked_cell_sits_in_its_band():
-    for name, band, (_, lat, _) in zip(weather.BAND_NAMES, weather.BANDS, weather.CELLS):
-        assert band[np.abs(LATS - lat).argmin()], name
 
 
 def test_places_read_their_own_cell():

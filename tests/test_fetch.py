@@ -10,7 +10,9 @@ SHAPE = (2, 3)
 
 def payloads(cloud=50, hours=("2026-11-02T00:00", "2026-11-02T01:00")):
     hourly = {"time": list(hours), "cloud_cover": [cloud] * len(hours),
-              "temperature_2m": [10.0] * len(hours), "precipitation": [0.0] * len(hours)}
+              "temperature_2m": [10.0] * len(hours), "precipitation": [0.0] * len(hours),
+              "pressure_msl": [1010.0] * len(hours), "wind_speed_10m": [5.0] * len(hours),
+              "wind_direction_10m": [90.0] * len(hours), "total_column_integrated_water_vapour": [20.0] * len(hours)}
     return [{"hourly": hourly} for _ in range(SHAPE[0] * SHAPE[1])]
 
 
@@ -18,6 +20,12 @@ def test_parses_into_time_lat_lon():
     hours, fields = fetch.parse_weather(payloads(), SHAPE)
     assert hours.size == 2
     assert fields["cloud"].shape == (2, *SHAPE)
+
+
+def test_url_asks_for_every_variable_with_wind_in_metres_a_second():
+    url = fetch.weather_url(fetch.cells()[:2], 3)
+    assert "wind_speed_unit=ms" in url
+    assert all(name in url for name in fetch.VARIABLES.values())
 
 
 def test_null_becomes_nan():

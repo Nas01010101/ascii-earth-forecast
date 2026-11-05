@@ -13,17 +13,16 @@ from pathlib import Path
 
 import numpy as np
 
-from . import drift, fetch, orbits, weather
+from . import cloudnet, drift, fetch, orbits, weather
 
 HISTORY_DAYS = 60
-SCORED_DAYS = 7
 LOSS_DAYS = 28
+STEP_DAYS = cloudnet.DAYS_NEEDED + 8  # the network's window, and a week of replays after a missed run
 SNAPSHOT_DAYS = 38  # a 7-day forecast, its 30-day update count, and the day it is checked
 MAX_MISSING = 0.01
 MIN_HOURS = 18
 FRAME_HOURS = 3
 RAMP = " .:-=+*#%@"
-ERROR_RAMP_MAX = 50
 CLOUD_RANGE = (0, 100)
 
 
@@ -58,7 +57,9 @@ def load_forecasts(root):
         return {}
     with np.load(path) as saved:
         days, cloud, temp, issued = saved["days"], saved["cloud"], saved["temp"], saved["issued"]
-    return {str(d): (cloud[i], temp[i], bool(issued[i])) for i, d in enumerate(days)}
+        # Forecasts stored before the network have no flag, and all came from the ridge.
+        net = saved["net"] if "net" in saved.files else np.zeros(len(days), dtype=bool)
+    return {str(d): (cloud[i], temp[i], bool(issued[i]), bool(net[i])) for i, d in enumerate(days)}
 
 
 def save_forecasts(root, forecasts):
@@ -67,8 +68,27 @@ def save_forecasts(root, forecasts):
     np.savez_compressed(temp, days=np.array(days),
                         cloud=np.stack([forecasts[d][0] for d in days]).astype(np.float32),
                         temp=np.stack([forecasts[d][1] for d in days]).astype(np.float32),
-                        issued=np.array([forecasts[d][2] for d in days]))
+                        issued=np.array([forecasts[d][2] for d in days]),
+                        net=np.array([forecasts[d][3] for d in days]))
     os.replace(temp, root / "forecasts.npz")
+
+
+def load_steps(root):
+    path = root / "steps.npz"
+    if not path.exists():
+        return {}
+    with np.load(path) as saved:
+        days, values = saved["days"], saved["values"]
+    return {str(d): values[i] for i, d in enumerate(days)}
+
+
+def save_steps(root, steps):
+    days = sorted(steps)
+    if not days:
+        return
+    temp = root / "steps.tmp.npz"
+    np.savez_compressed(temp, days=np.array(days), values=np.stack([steps[d] for d in days]))
+    os.replace(temp, root / "steps.npz")
 
 
 def add_days(history, hours, fields, today):
@@ -91,6 +111,27 @@ def add_days(history, hours, fields, today):
         del history[old]
 
 
+def add_steps(steps, hours, fields, today):
+    """Adds each past day the network can read that is not held yet, then trims to its window.
+
+    Same rules as add_days: stored days are never rewritten, and a day with too many missing cells is left out
+    and asked for again on the next run.
+    """
+    for back in range(STEP_DAYS, 0, -1):
+        day = today - timedelta(days=back)
+        if day.isoformat() in steps:
+            continue
+        found = cloudnet.day_steps(hours, fields, day)
+        if found is None:
+            continue
+        if np.isnan(found).mean(axis=(2, 3)).max() > MAX_MISSING:
+            print(f"::warning::weather: over {MAX_MISSING:.0%} of a 6-hourly field missing on {day}", file=sys.stderr)
+            continue
+        steps[day.isoformat()] = np.stack([[_fill(field) for field in variable] for variable in found])
+    for old in sorted(steps)[:-STEP_DAYS]:
+        del steps[old]
+
+
 def _daily_mean(hours):
     """Mean over the hours present; a cell with under MIN_HOURS of them is missing."""
     present = ~np.isnan(hours)
@@ -101,12 +142,13 @@ def _daily_mean(hours):
     return mean
 
 
-def days_to_fetch(history, today):
+def days_to_fetch(history, steps, today):
     """How many past days to request: back to the oldest one missing, so a hole heals on the next run."""
-    for back in range(fetch.BOOTSTRAP_DAYS, 0, -1):
-        if (today - timedelta(days=back)).isoformat() not in history:
-            return back
-    return 0
+    def oldest(held, window):
+        return max((b for b in range(1, window + 1) if (today - timedelta(days=b)).isoformat() not in held), default=0)
+    # A day's first 6-hourly rain reads the last hours of the day before it.
+    missing_step = oldest(steps, STEP_DAYS)
+    return max(oldest(history, fetch.BOOTSTRAP_DAYS), missing_step + 1 if missing_step else 0)
 
 
 def _fill(field):
@@ -136,12 +178,22 @@ def picture(field, top):
     return ["".join(RAMP[i] for i in row) for row in index[::-1]]
 
 
-def _forecast(cloud, temp, target):
-    """Forecasts day index target from the days before it. Cover outside 0..100 cannot happen."""
-    return np.clip(weather.predict(cloud, target)[0], *CLOUD_RANGE), weather.predict(temp, target)[0]
+def _forecast(cloud, temp, target, when, steps, saved):
+    """Forecasts a day from the days before it, as (cloud, temp, whether the network made the cloud).
+
+    The network needs all 30 days of 6-hourly steps. When any is missing the cloud comes from the ridge, so a
+    forecast is still kept, and the flag says which model made it. Cover outside 0..100 cannot happen.
+    """
+    held = cloudnet.view(steps, when)
+    if held is None:
+        print(f"::warning::weather: 6-hourly days missing before {when}, cloud from the ridge", file=sys.stderr)
+        found = weather.predict(cloud, target)[0]
+    else:
+        found = cloudnet.predict(held, when, saved)
+    return np.clip(found, *CLOUD_RANGE), weather.predict(temp, target)[0], held is not None
 
 
-def keep_forecasts(forecasts, days, history, today):
+def keep_forecasts(forecasts, days, history, steps, today, saved):
     """Stores today's forecast as issued and replays the recent days that have none. No entry is rewritten.
 
     A replay runs the same code on the stored days before its target, and stays flagged as not issued.
@@ -149,10 +201,12 @@ def keep_forecasts(forecasts, days, history, today):
     cloud = np.stack([history[d][0] for d in days])
     temp = np.stack([history[d][1] for d in days])
     if today.isoformat() not in forecasts:
-        forecasts[today.isoformat()] = (*_forecast(cloud, temp, len(days)), True)
+        made = _forecast(cloud, temp, len(days), today, steps, saved)
+        forecasts[today.isoformat()] = (made[0], made[1], True, made[2])
     for target in range(max(len(days) - LOSS_DAYS, weather.MIN_TRAIN_DAYS + 3), len(days)):
         if days[target] not in forecasts:
-            forecasts[days[target]] = (*_forecast(cloud, temp, target), False)
+            made = _forecast(cloud, temp, target, date.fromisoformat(days[target]), steps, saved)
+            forecasts[days[target]] = (made[0], made[1], False, made[2])
 
 
 def forecast_losses(forecasts, history):
@@ -160,7 +214,7 @@ def forecast_losses(forecasts, history):
     rows = []
     for day in sorted(set(forecasts) & set(history))[-LOSS_DAYS:]:
         before = history.get((date.fromisoformat(day) - timedelta(days=1)).isoformat())
-        row = {"date": day, "issued": forecasts[day][2]}
+        row = {"date": day, "issued": forecasts[day][2], "net": forecasts[day][3]}
         for i, name in enumerate(("cloud", "temp")):
             row[name] = {"model": round(weather.mse(history[day][i], forecasts[day][i]), 1),
                          "repeat": round(weather.mse(history[day][i], before[i]), 1) if before else None}
@@ -168,56 +222,18 @@ def forecast_losses(forecasts, history):
     return rows
 
 
-def weather_section(days, history, today):
-    if len(days) <= weather.MIN_TRAIN_DAYS + 3:
-        raise fetch.SourceError(f"weather: {len(days)} consecutive days is too few to score")
-    cloud = np.stack([history[d][0] for d in days])
-    temp = np.stack([history[d][1] for d in days])
-    series = {"cloud": cloud, "temp": temp}
-    scored = []
-    keep = {}
-    first = max(len(days) - SCORED_DAYS, weather.MIN_TRAIN_DAYS + 3)
-    for target in range(first, len(days)):
-        row = {"date": days[target]}
-        for name, values in series.items():
-            forecast, trailing = weather.predict(values, target)
-            # Cover outside 0..100 cannot happen, and the score must describe the map the page draws.
-            if name == "cloud":
-                forecast = np.clip(forecast, *CLOUD_RANGE)
-            row[name] = weather.score(values[target], forecast, values[target - 1], trailing)
-            keep[name] = forecast, values[target]
-        scored.append(row)
-    today_cloud, today_temp = _forecast(cloud, temp, len(days))
-    forecast, actual = keep["cloud"]
-    week = {name: {k: round(float(np.mean([r[name][k] for r in scored])), 2) for k in scored[0][name]} for name in series}
+def weather_section(days, history, forecasts, today):
+    cloud, temp, _, net = forecasts[today.isoformat()]
     return {
-        "days": scored,
-        "week": week,
         "train_days": len(days),
-        "features": list(weather.FEATURES),
         "today": {
             "date": today.isoformat(),
-            "cloud_mean": round(_area_mean(today_cloud), 1),
-            "temp_mean": round(_area_mean(today_temp), 1),
-            "places": weather.at_places(today_cloud, today_temp),
-            "map": picture(today_cloud, 100),
+            "net": net,
+            "places": weather.at_places(cloud, temp),
+            "map": picture(cloud, 100),
         },
-        "last_scored": {
-            "date": scored[-1]["date"],
-            "forecast": picture(forecast, 100),
-            "actual": picture(actual, 100),
-            "error": picture(np.abs(forecast - actual), ERROR_RAMP_MAX),
-        },
-        "model": {
-            "date": days[-1],
-            "ridge": weather.RIDGE,
-            "bands": weather.explain(cloud, len(days) - 1, CLOUD_RANGE),
-        },
+        "last_scored": {"date": days[-1], "actual": picture(history[days[-1]][0], 100)},
     }
-
-
-def _area_mean(field):
-    return float((field * weather.AREA).sum() / (weather.AREA.sum() * field.shape[1]))
 
 
 def planet_frames(hours, fields, today):
@@ -236,18 +252,21 @@ def planet_frames(hours, fields, today):
 
 
 def update_weather(root, today):
-    history = load_history(root)
-    hours, fields = fetch.weather(days_to_fetch(history, today))
+    history, steps = load_history(root), load_steps(root)
+    hours, fields = fetch.weather(days_to_fetch(history, steps, today))
     # The planet needs only today's forecast, so a problem with past days cannot hold it back.
     write_atomic(root / "planet.bin", planet_frames(hours, fields, today))
     add_days(history, hours, fields, today)
     save_history(root, history)
+    add_steps(steps, hours, fields, today)
+    save_steps(root, steps)
     days = consecutive(history, today)
-    section = weather_section(days, history, today)
+    if len(days) <= weather.MIN_TRAIN_DAYS + 3:
+        raise fetch.SourceError(f"weather: {len(days)} consecutive days is too few to forecast")
     forecasts = load_forecasts(root)
-    keep_forecasts(forecasts, days, history, today)
+    keep_forecasts(forecasts, days, history, steps, today, cloudnet.load())
     save_forecasts(root, forecasts)
-    return {**section, "losses": forecast_losses(forecasts, history)}
+    return {**weather_section(days, history, forecasts, today), "losses": forecast_losses(forecasts, history)}
 
 
 def stored_losses(root):

@@ -11,8 +11,10 @@ import numpy as np
 STEP = 7.5
 LATS = np.arange(-90 + STEP / 2, 90, STEP)
 LONS = np.arange(-180 + STEP / 2, 180, STEP)
-VARIABLES = {"cloud": "cloud_cover", "temp": "temperature_2m", "precip": "precipitation"}
-LIMITS = {"cloud": (0, 100), "temp": (-95, 65), "precip": (0, 500)}
+VARIABLES = {"cloud": "cloud_cover", "temp": "temperature_2m", "precip": "precipitation", "pressure": "pressure_msl",
+             "speed": "wind_speed_10m", "direction": "wind_direction_10m", "water": "total_column_integrated_water_vapour"}
+LIMITS = {"cloud": (0, 100), "temp": (-95, 65), "precip": (0, 500), "pressure": (800, 1150),
+          "speed": (0, 200), "direction": (0, 360), "water": (0, 200)}
 GP_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=csv"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 CHUNK = 100
@@ -57,6 +59,7 @@ def weather_url(points, past_days):
         "latitude": ",".join(f"{v:g}" for v in points[:, 0]),
         "longitude": ",".join(f"{v:g}" for v in points[:, 1]),
         "hourly": ",".join(VARIABLES.values()),
+        "wind_speed_unit": "ms",
         "past_days": past_days,
         "forecast_days": FORECAST_DAYS,
         "timezone": "UTC",
