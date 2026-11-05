@@ -20,4 +20,4 @@ build-backend = "setuptools.build_meta"
 packages = ["forecast"]
 
 [tool.setuptools.package-data]
-forecast = ["cloud_weights.npz", "drift_weights.npz"]
+forecast = ["cloud_weights.npz", "drift_weights.npz", "temp_weights.npz", "pressure_weights.npz"]

@@ -13,7 +13,7 @@ from forecast import cloudnet  # noqa: E402
 
 import candidate  # noqa: E402
 import fetch_openmeteo  # noqa: E402
-from export_weights import export  # noqa: E402
+from export_weights import export, export_seeds  # noqa: E402
 from features import Spec, one_day  # noqa: E402
 from nets import UNet  # noqa: E402
 
@@ -147,3 +147,27 @@ def test_a_layers_file_over_the_cloud_scales_gives_the_same_forecast(tmp_path):
     joined = cloudnet.load_others(cloud_file, {"pressure": layers})["pressure"]
     steps = held()
     assert np.array_equal(cloudnet.predict(steps, WHEN, joined, "pressure"), cloudnet.predict(steps, WHEN, cloudnet.load(whole), "pressure"))
+
+
+def test_a_seeds_file_gives_the_mean_of_its_networks(tmp_path):
+    spec = Spec(cloudnet.VARIABLES, cloudnet.STEPS_PER_DAY, cloudnet.LAGS, "temp")
+    stats = scales(np.random.default_rng(3))
+    paths, whole = [], []
+    for seed in range(3):
+        torch.manual_seed(seed)
+        net = UNet(spec.channels, 8, 4)
+        torch.nn.init.normal_(net.out.weight, std=.1)
+        paths.append(tmp_path / f"net{seed}.pt")
+        torch.save({"kind": "net", "state": net.state_dict(), "stats": stats, "width": 8, "place": 4,
+                    "spec": {"variables": spec.variables, "steps": spec.steps, "lags": spec.lags, "target": "temp"}}, paths[-1])
+        whole.append(tmp_path / f"w{seed}.npz")
+        export(whole[-1], paths[-1], "float16")
+    seeds = tmp_path / "seeds.npz"
+    export_seeds(seeds, paths)
+    scale_file = cloudnet.load(whole[0])
+    joined = cloudnet.load_others(scale_file, {"temp": seeds})["temp"]
+    assert len(joined) == 3
+    steps = held()
+    alone = [cloudnet.predict(steps, WHEN, cloudnet.load(path), "temp") for path in whole]
+    assert np.allclose(cloudnet.predict(steps, WHEN, joined, "temp"), np.mean(alone, axis=0), atol=1e-4)
+    assert not np.allclose(alone[0], alone[1], atol=1e-2)  # the mean above is of three different forecasts

@@ -1,4 +1,4 @@
-"""Forecasts a day's mean cloud cover, temperature and pressure with one U-Net each, run with numpy in the daily job.
+"""Forecasts a day's mean cloud cover, temperature and pressure with U-Nets, run with numpy in the daily job.
 
 The weights are trained offline on ERA5 (research/weather) and frozen here. A forecast reads the 30 days before
 its target, 6-hourly, so replaying a past day gives what would have been issued on it. The formulas match
@@ -29,12 +29,20 @@ def load(path=WEIGHTS):
         return {name: saved[name].astype(np.float32) for name in saved.files}
 
 
+def _seeds(layers):
+    """One set of layers per `seed<k>/` prefix. A file with no prefix holds one network."""
+    prefixes = sorted({name.split("/")[0] for name in layers if "/" in name})
+    if not prefixes:
+        return [layers]
+    return [{name.split("/", 1)[1]: value for name, value in layers.items() if name.startswith(f"{prefix}/")} for prefix in prefixes]
+
+
 def load_others(saved, files=None):
-    """The networks of the other targets, each its own layers over the scales of `saved`. No file means no network."""
+    """The networks of the other targets: per target a list of seeds, each its own layers over the scales of `saved`. No file means no network."""
     found = {}
     for name, path in (OTHER_WEIGHTS if files is None else files).items():
         if Path(path).exists():
-            found[name] = {**saved, **load(path)}
+            found[name] = [{**saved, **layers} for layers in _seeds(load(path))]
     return found
 
 
@@ -134,6 +142,7 @@ def network(x, net):
 
 
 def predict(held, when, saved, target="cloud"):
-    """The target variable's daily mean in its own unit (cloud in percent, not yet clipped)."""
-    x, base = inputs(held, when, saved, target)
-    return base + network(x, saved) * saved[f"std_{target}"]
+    """The target variable's daily mean in its own unit (cloud in percent, not yet clipped). `saved` is one network or a list of seeds to average."""
+    nets = saved if isinstance(saved, list) else [saved]
+    x, base = inputs(held, when, nets[0], target)
+    return base + np.mean([network(x, net) for net in nets], axis=0) * nets[0][f"std_{target}"]

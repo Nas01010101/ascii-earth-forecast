@@ -6,6 +6,11 @@ on:
     # GitHub can drop a scheduled run. This one fetches only what the first did not finish.
     - cron: "37 7 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Run updates already done today
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -35,6 +40,8 @@ jobs:
       - id: forecast
         run: python -m forecast data
         continue-on-error: true
+        env:
+          FORCE: ${{ inputs.force }}
       # The data branch keeps yesterday's files when today's could not be read.
       - run: python -m forecast.check data
       - run: scripts/data_branch.sh publish "$REMOTE" "$PWD/data"

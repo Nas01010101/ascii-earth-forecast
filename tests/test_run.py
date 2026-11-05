@@ -446,6 +446,17 @@ def test_an_update_done_today_is_not_run_again(tmp_path):
     assert len(calls) == 2
 
 
+def test_force_runs_an_update_done_today_again(tmp_path):
+    calls = []
+    def update(root, today):
+        calls.append(today)
+        return {}
+    today = date(2026, 11, 5)
+    assert run.run(tmp_path, today, {"weather": update}) == 0
+    assert run.run(tmp_path, today, {"weather": update}, force=True) == 0
+    assert calls == [today, today]
+
+
 def test_a_later_run_retries_only_the_source_that_failed(tmp_path):
     calls = {"weather": 0, "satellites": 0}
     def good(root, today):
@@ -518,8 +529,16 @@ def test_an_other_network_keeps_its_own_layers_over_the_shared_scales(tmp_path):
     saved = {"clim_temp": np.zeros(1, dtype=np.float32), "out.weight": np.zeros(1, dtype=np.float32)}
     np.savez(tmp_path / "t.npz", **{"out.weight": np.ones(1)})
     found = run.cloudnet.load_others(saved, {"temp": tmp_path / "t.npz"})["temp"]
-    assert found["out.weight"][0] == 1 and found["clim_temp"] is saved["clim_temp"]
+    assert len(found) == 1 and found[0]["out.weight"][0] == 1 and found[0]["clim_temp"] is saved["clim_temp"]
     assert saved["out.weight"][0] == 0
+
+
+def test_a_file_of_seeds_loads_one_network_per_seed(tmp_path):
+    saved = {"clim_temp": np.zeros(1, dtype=np.float32)}
+    np.savez(tmp_path / "t.npz", **{"seed0/out.weight": np.ones(1), "seed1/out.weight": np.full(1, 2.0)})
+    found = run.cloudnet.load_others(saved, {"temp": tmp_path / "t.npz"})["temp"]
+    assert [net["out.weight"][0] for net in found] == [1, 2]
+    assert all(net["clim_temp"] is saved["clim_temp"] for net in found)
 
 
 def test_stored_forecasts_keep_pressure_and_read_older_files(tmp_path):

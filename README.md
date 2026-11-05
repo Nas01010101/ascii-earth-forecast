@@ -24,9 +24,9 @@ preprocess                             preprocess
   |                                      |
   v                                      v
 predict                                predict
-cloud: U-Net reading 30 days, frozen   SGP4 from elements 1, 3 and 7 days
-temperature: ridge regression, refit   old, plus a residual network: 6
-daily; cloud too if days are missing   blocks, 256 wide, mean of 3, frozen
+cloud, temperature, pressure: U-Nets   SGP4 from elements 1, 3 and 7 days
+reading 30 days, frozen; ridge for     old, plus a residual network: 6
+cloud and temp if days are missing     blocks, 256 wide, mean of 3, frozen
   |                                      |
   v                                      v
 actual                                 actual
@@ -42,7 +42,7 @@ repeating the day before
 
 ## Scoring
 
-- **Weather.** Each run keeps that day's forecast of cloud cover and 2 m temperature in `forecasts.npz`, and `weather.losses` scores the kept forecasts of the last 28 finished days against what happened and against repeating the day before. The loss is the area-weighted squared error. A row has `issued: true` when the forecast was kept on the day it was made and `issued: false` when it was replayed from stored days because no forecast was kept then, and `net: true` when the network made its cloud map rather than the ridge. A replay uses only earlier days, and a kept forecast is never rewritten.
+- **Weather.** Each run keeps that day's forecast of cloud cover, 2 m temperature and pressure in `forecasts.npz`, and `weather.losses` scores the kept forecasts of the last 28 finished days against what happened and against repeating the day before. The loss is the area-weighted squared error. A row has `issued: true` when the forecast was kept on the day it was made and `issued: false` when it was replayed from stored days because no forecast was kept then, and `net: true` when the network made its cloud map rather than the ridge. A replay uses only earlier days, and a kept forecast is never rewritten.
 - **Satellites.** Each day, `satellites.losses` scores the forecasts that started 1, 3 and 7 days earlier: the median distance in km of SGP4 alone and of SGP4 with the network's correction. A forecast reads only the element sets held when it started. A row has `issued: true` when it was scored on its own day and `issued: false` when it was replayed from stored snapshots after a missed run.
 
 "Actual" is a public reference with its own error, which these scores do not include. For weather it is Open-Meteo's model output for past hours, not station readings. For satellites it is SGP4 run from the newest published elements, not a tracking measurement.
@@ -60,6 +60,16 @@ repeating the day before
 | Same days, Open-Meteo's own forecast made a day earlier | 172.1 | |
 
 The Open-Meteo forecast is a reference and not a fair bar: it is scored against output of the same system. The gap between 48% and 18% is not fully explained. The stored days are point values at 7.5 degree cells and the network trained on ERA5's 1.5 degree area means, and the Open-Meteo fields have a wider spread than ERA5's (cloud standard deviation 1.36 times ERA5's), with no sign of a unit error. `weather.losses` is the test of the kept forecasts.
+
+`forecast/temp_weights.npz` and `forecast/pressure_weights.npz` hold three U-Nets each, 1,294,049 weights per network, reading the same 7 fields over the same 30 days. Each was trained on ERA5, then fine-tuned on 30 Open-Meteo days from 2026-07-18, stopping on the next 15. A forecast is the mean of the three. The weights are the ones scored below, not refit on the test days.
+
+| Test against the ridge fed 24-hour means | Temperature | Pressure |
+|---|---|---|
+| Sealed Open-Meteo days, 2026-10-07 to 2026-11-03 | 61.42% below | 62.99% below |
+| Selection days, 2026-09-01 to 2026-10-06 | 64.36% below | 63.60% below |
+| Selection days, Open-Meteo's own forecast made a day earlier | 89.72% below | not fetched |
+
+The mean of both fields on the sealed days is 62.20% below the ridge, standard error 0.75.
 
 ## Satellite network
 

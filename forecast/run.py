@@ -354,7 +354,7 @@ def done_today(report, name, today):
     return status.get("ok") is True and status.get("updated") == today.isoformat()
 
 
-def run(root, today, updates):
+def run(root, today, updates, force=False):
     """Runs each named update not yet done today, keeping the previous section when a source fails. Returns failure count.
 
     The workflow runs twice a day because GitHub can drop a scheduled run. The later run fetches only what is missing.
@@ -363,7 +363,7 @@ def run(root, today, updates):
     report = json.loads(path.read_text()) if path.exists() else {}
     failures = 0
     for name, update in updates.items():
-        if done_today(report, name, today):
+        if not force and done_today(report, name, today):
             print(f"{name}: done today", file=sys.stderr)
             continue
         try:
@@ -388,4 +388,4 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
     today = datetime.now(timezone.utc).date()
     updates = {"weather": update_weather, "satellites": update_satellites}
-    return 1 if run(root, today, updates) == len(updates) else 0
+    return 1 if run(root, today, updates, force=os.environ.get("FORCE") == "true") == len(updates) else 0
