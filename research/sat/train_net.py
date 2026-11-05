@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from build_samples import FEATURES, HISTORY_FEATURES, WEATHER_FEATURES
-from data import HISTORY_TAIL, day, inputs, load, metric_weights, own_drift
+from data import HISTORY_TAIL, day, hide_history, inputs, load, load_folder, metric_weights, own_drift
 from score import group_scores
 
 TRAIN_SHARDS = set(range(16))
@@ -137,6 +137,14 @@ def fit(train: dict, args, device) -> Net:
     return net
 
 
+def train_rows(args, start: float, end: float, shards: set) -> dict:
+    if args.train_samples:
+        rows = load_folder(args.train_samples, start, end, shards, rate=args.rate, seed=args.seed)
+    else:
+        rows = load(args.fit, start, end, shards=shards, rate=args.rate, seed=args.seed)
+    return hide_history(rows, args.history_dropout, args.seed)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("fit"), p.add_argument("holdout"), p.add_argument("out"), p.add_argument("name")
@@ -155,6 +163,8 @@ def main() -> None:
     p.add_argument("--solar-ratio", action="store_true")
     p.add_argument("--fixed-dt", action="store_true")
     p.add_argument("--skip-holdout", action="store_true")
+    p.add_argument("--train-samples", default="", help="folder of shard files to train on, in place of FIT_PARQUET; validation stays on FIT_PARQUET")
+    p.add_argument("--history-dropout", type=float, default=0.0, help="share of training rows shown with few days of history")
     args = p.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = Path(args.out)
@@ -162,7 +172,7 @@ def main() -> None:
 
     shards = train_shards(args.extra_shards)
     start = day(args.start_year)
-    train = load(args.fit, start, VAL_START, shards=shards, rate=args.rate, seed=args.seed)
+    train = train_rows(args, start, VAL_START, shards)
     val = load(args.fit, VAL_START, END, shards=VAL_SHARDS)
     print(f"train {len(train['dt'])} val {len(val['dt'])} rows on {device}", flush=True)
     net = fit(train, args, device)
@@ -173,9 +183,10 @@ def main() -> None:
     print(args.name, "val", np.round(scores, 2), "mean", round(float(scores.mean()), 2), flush=True)
     del train
     if args.skip_holdout:
+        torch.save({"state": net.state_dict(), "args": vars(args)}, out_dir / f"{args.name}.pt")
         return
 
-    refit = load(args.fit, start, END, shards=shards, rate=args.rate, seed=args.seed)
+    refit = train_rows(args, start, END, shards)
     net = fit(refit, args, device)
     del refit, val
     hold = load(args.holdout, END, day(2026), labelled=False)

@@ -68,7 +68,12 @@ def error_of(sat_old, sat_new, dt_days: float):
     return curvilinear_error(r0, v0, r1)
 
 
-def object_samples(norad: int, row: dict, weather: dict) -> list:
+def fixed_targets(norad: int, t: float) -> list:
+    """(label, gap after t0 the truth set must reach, how much later it may arrive), one per row wanted at t0."""
+    return [(h, h, TOLERANCE_DAYS) for h in HORIZONS]
+
+
+def object_samples(norad: int, row: dict, weather: dict, targets=fixed_targets) -> list:
     epoch = row["epoch"]
     sats, out = {}, []
 
@@ -98,19 +103,19 @@ def object_samples(norad: int, row: dict, weather: dict) -> list:
                 history += [np.nan] * 6
             else:
                 history += [float(t - epoch[j]), found[0], found[1], found[2], row["no_rev"][i] - row["no_rev"][j], row["bstar"][i] - row["bstar"][j]]
-        for h in HORIZONS:
-            j = int(np.searchsorted(epoch, t + h))
-            if j >= len(epoch) or epoch[j] - (t + h) > TOLERANCE_DAYS:
+        for label, gap, tolerance in targets(norad, float(t)):
+            j = int(np.searchsorted(epoch, t + gap))
+            if j >= len(epoch) or epoch[j] - (t + gap) > tolerance:
                 continue
             dt = float(epoch[j] - t)
             found = error_of(sat(i), sat(j), dt)
             if found is None:
                 continue
-            out.append((norad, float(t), h, dt, found[3], *found[:3], *base, *history, *sw))
+            out.append((norad, float(t), label, dt, found[3], *found[:3], *base, *history, *sw))
     return out
 
 
-def main(shard: str, sw_path: str, out_path: str) -> None:
+def main(shard: str, sw_path: str, out_path: str, targets=fixed_targets) -> None:
     weather = read_space_weather(sw_path)
     tables =[pq.read_table(p, columns=list(COLUMNS)) for p in sorted(Path(shard).glob("*.parquet"))]
     table = pa.concat_tables(tables)
@@ -140,7 +145,7 @@ def main(shard: str, sw_path: str, out_path: str) -> None:
         idx = order[bounds[k]:bounds[k + 1]]
         keep = idx[dedupe_sorted(arrays["epoch"][idx])]
         row = {c: arrays[c][keep] for c in COLUMNS[1:]}
-        rows += object_samples(int(obj), row, weather)
+        rows += object_samples(int(obj), row, weather, targets)
         objects += 1
         if len(rows) >= 200000:
             flush()

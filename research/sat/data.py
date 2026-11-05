@@ -43,12 +43,13 @@ def load(path: str, start: float, end: float, shards: set | None = None, rate: f
     return {k: np.concatenate([part[k] for part in keep]) for k in keep[0]}
 
 
-def load_folder(folder: str, start: float, end: float, shards: set | None = None) -> dict:
+def load_folder(folder: str, start: float, end: float, shards: set | None = None, rate: float = 1.0, seed: int = 0) -> dict:
     """load() over a folder of shard_NN.parquet files, where NN is norad % 64."""
     parts = []
     for path in sorted(Path(folder).glob("shard_*.parquet")):
-        if pq.ParquetFile(path).metadata.num_rows and (shards is None or int(path.stem.split("_")[1]) in shards):
-            parts.append(load(str(path), start, end))
+        shard = int(path.stem.split("_")[1])
+        if pq.ParquetFile(path).metadata.num_rows and (shards is None or shard in shards):
+            parts.append(load(str(path), start, end, rate=rate, seed=seed + shard))
     # popped key by key: holding every part through the concatenation doubles the peak
     return {k: np.concatenate([part.pop(k) for part in parts]) for k in list(parts[0])}
 
@@ -73,6 +74,34 @@ def own_drift(d: dict) -> np.ndarray:
         bottom[ok] += age[ok] ** 4
     c = np.divide(top, bottom, out=np.zeros_like(top), where=bottom > 0)
     return (c * d["dt"].astype(np.float64) ** 2).astype(np.float32)
+
+
+def with_days_held(d: dict, days) -> dict:
+    """A copy of the samples as a job with `days` of snapshots would see them; one number, or one per row."""
+    x = d["x"].copy()
+    days = np.broadcast_to(days, (len(x),))
+    for back in LOOKBACKS:
+        hidden = ~(x[:, FEATURES.index(f"age_{int(back)}")] <= days)
+        for name in ("age", "height", "along", "cross", "dno", "dbstar"):
+            x[hidden, FEATURES.index(f"{name}_{int(back)}")] = np.nan
+    x[days == 0, FEATURES.index("updates_30d")] = 0.0
+    return {**d, "x": x}
+
+
+# Past 8 days the job holds nearly every lookback, so a longer draw would change nothing in the row.
+HIDDEN_DAYS = (0.0, 2.0, 4.0, 8.0)
+
+
+def hide_history(d: dict, share: float, seed: int) -> dict:
+    """Shows `share` of the rows as a job with few snapshots sees them, so the network learns those objects too."""
+    if share <= 0:
+        return d
+    rng = np.random.default_rng(seed)
+    n = len(d["x"])
+    days = np.full(n, np.inf)
+    picked = rng.random(n) < share
+    days[picked] = rng.choice(HIDDEN_DAYS, picked.sum())
+    return with_days_held(d, days)
 
 
 def slog(v: np.ndarray) -> np.ndarray:
@@ -115,7 +144,7 @@ def inputs(d: dict) -> np.ndarray:
 def metric_weights(d: dict) -> np.ndarray:
     """Weights that turn a sum of misses into the score: each object and horizon counts once, relative to its raw error."""
     raw = np.linalg.norm(d["y"], axis=1).astype(np.float64)
-    key = d["norad"].astype(np.int64) * 100 + d["horizon"].astype(np.int64)
+    key = d["norad"].astype(np.int64) * 100000 + np.round(d["horizon"].astype(np.float64) * 1000).astype(np.int64)  # buckets start at 1/8 day
     _, inverse = np.unique(key, return_inverse=True)
     total = np.bincount(inverse, raw)
     w = 1.0 / np.maximum(total[inverse], 1e-3)
