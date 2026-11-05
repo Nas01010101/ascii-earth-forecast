@@ -231,6 +231,8 @@ def weather_section(days, history, forecasts, today):
             "net": net,
             "places": weather.at_places(cloud, temp),
             "map": picture(cloud, 100),
+            # Whole percent, south to north and west to east, for the viewer's cloud switch.
+            "cloud": np.clip(cloud, *CLOUD_RANGE).round().astype(int).ravel().tolist(),
         },
         "last_scored": {"date": days[-1], "actual": picture(history[days[-1]][0], 100)},
     }
@@ -304,16 +306,29 @@ def update_satellites(root, today):
         old.unlink()
     snapshots = {date.fromisoformat(p.name.split(".")[0]): orbits.parse(gzip.decompress(p.read_bytes()).decode())
                  for p in folder.glob("*.csv.gz")}
+    # After the snapshot, so a rerun that finds the snapshot still writes the viewer's file.
+    write_atomic(root / "corrections.bin", drift.pack_corrections(snapshots, today, drift.load_nets()))
     return {"as_of": today.isoformat(), "count": len(snapshots[today]),
             "losses": satellite_losses(stored_losses(root), snapshots, today)}
 
 
+def done_today(report, name, today):
+    status = report.get("status", {}).get(name, {})
+    return status.get("ok") is True and status.get("updated") == today.isoformat()
+
+
 def run(root, today, updates):
-    """Runs each named update, keeping the previous section when a source fails. Returns failure count."""
+    """Runs each named update not yet done today, keeping the previous section when a source fails. Returns failure count.
+
+    The workflow runs twice a day because GitHub can drop a scheduled run. The later run fetches only what is missing.
+    """
     path = root / "forecast.json"
     report = json.loads(path.read_text()) if path.exists() else {}
     failures = 0
     for name, update in updates.items():
+        if done_today(report, name, today):
+            print(f"{name}: done today", file=sys.stderr)
+            continue
         try:
             section = update(root, today)
             # allow_nan=False makes a NaN in a score fail its source instead of breaking the page's JSON.parse.

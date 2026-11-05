@@ -149,6 +149,18 @@ def test_today_names_places_with_the_stored_forecast():
     assert {p["temp"] for p in today["places"]} == {150.0}
 
 
+def test_today_carries_the_network_cloud_grid_as_whole_percent():
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    history = {d: (field(90), field(0)) for d in days}
+    cloud = field(40.4)
+    cloud[0, 0], cloud[-1, -1] = -3.0, 120.0
+    forecasts = {TODAY.isoformat(): (cloud, field(150), True, True)}
+    grid = run.weather_section(days, history, forecasts, TODAY)["today"]["cloud"]
+    assert len(grid) == cloud.size
+    assert all(type(v) is int for v in grid)
+    assert (grid[0], grid[1], grid[-1]) == (0, 40, 100)
+
+
 def test_a_field_with_too_many_missing_cells_keeps_the_ridge_and_says_so(tmp_path, monkeypatch):
     def no_water(past):
         hours, fields = hourly(past)
@@ -254,7 +266,8 @@ def test_one_failing_source_keeps_the_last_good_section(tmp_path):
     def down(root, today):
         raise fetch.SourceError("down")
     assert run.run(tmp_path, TODAY, {"weather": ok, "satellites": ok}) == 0
-    assert run.run(tmp_path, TODAY, {"weather": down, "satellites": ok}) == 1
+    tomorrow = TODAY + timedelta(days=1)
+    assert run.run(tmp_path, tomorrow, {"weather": down, "satellites": ok}) == 1
     report = json.loads((tmp_path / "forecast.json").read_text())
     assert report["weather"] == {"value": 1}
     assert report["status"]["weather"]["ok"] is False
@@ -392,3 +405,35 @@ def test_tomorrow_scores_todays_issued_forecast(tmp_path, monkeypatch):
     assert last["date"] == TODAY.isoformat() and last["issued"] is True
     actual = run.load_history(tmp_path)[TODAY.isoformat()][0]
     assert last["cloud"]["model"] == round(run.weather.mse(actual, issued[0]), 1)
+
+
+def test_an_update_done_today_is_not_run_again(tmp_path):
+    calls = []
+    def update(root, today):
+        calls.append(today)
+        return {}
+    today = date(2026, 11, 5)
+    assert run.run(tmp_path, today, {"weather": update}) == 0
+    assert run.run(tmp_path, today, {"weather": update}) == 0
+    assert calls == [today]
+    assert run.run(tmp_path, today + timedelta(days=1), {"weather": update}) == 0
+    assert len(calls) == 2
+
+
+def test_a_later_run_retries_only_the_source_that_failed(tmp_path):
+    calls = {"weather": 0, "satellites": 0}
+    def good(root, today):
+        calls["weather"] += 1
+        return {}
+    outcomes = [RuntimeError("down"), {}]
+    def flaky(root, today):
+        calls["satellites"] += 1
+        result = outcomes.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+    today = date(2026, 11, 5)
+    updates = {"weather": good, "satellites": flaky}
+    assert run.run(tmp_path, today, updates) == 1
+    assert run.run(tmp_path, today, updates) == 0
+    assert calls == {"weather": 1, "satellites": 2}

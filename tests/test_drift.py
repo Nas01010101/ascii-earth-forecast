@@ -2,6 +2,7 @@ import csv
 import gzip
 import io
 import json
+import struct
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -13,6 +14,17 @@ from forecast import drift, fetch, orbits, run
 SAMPLE = (Path(__file__).parent / "active-sample.csv").read_text()
 TODAY = date(2026, 11, 20)
 NETS = drift.load_nets()
+
+
+def test_space_weather_values_do_not_reach_the_network():
+    x = np.zeros((1, len(drift.FEATURES)), np.float32)
+    x[0, drift.INDEX["no_rev"]] = 15.0
+    x[0, drift.INDEX[f"age_{int(drift.LOOKBACKS[0])}"]] = 1.0
+    x[0, drift.INDEX[f"along_{int(drift.LOOKBACKS[0])}"]] = 0.5
+    filled = x.copy()
+    filled[0, [drift.INDEX[name] for name in drift.WEATHER]] = (150.0, 140.0, 12.0)
+    dt = np.ones(1, np.float32)
+    assert np.array_equal(drift.correct(NETS, filled, dt), drift.correct(NETS, x, dt))
 
 
 def later(rows, hours):
@@ -113,3 +125,56 @@ def test_the_update_scores_today_from_stored_snapshots(tmp_path, monkeypatch):
     assert section["losses"][0]["date"] == TODAY.isoformat()
     assert section["losses"][0]["issued"] is True
     json.dumps(section, allow_nan=False)
+
+
+def test_an_object_with_no_earlier_set_keeps_its_sgp4_forecast():
+    # history_check: with no lookback the network misses by more than SGP4 (4.97 against 3.49 km at 3 days).
+    scored = drift.score_day(daily([-1, 0]), TODAY, NETS)["1"]
+    assert scored["corrected"] == 0 and scored["model_km"] == scored["sgp4_km"]
+
+
+def test_two_days_of_sets_turn_the_network_on():
+    scored = drift.score_day(daily([-3, -2, -1, 0]), TODAY, NETS)["1"]
+    assert scored["corrected"] == scored["n"] and scored["model_km"] != scored["sgp4_km"]
+
+
+def test_one_day_held_stays_off_even_with_a_lookback():
+    x = np.full((2, len(drift.FEATURES)), np.nan, np.float32)
+    x[1, drift.INDEX["age_1"]] = 1.2
+    assert drift.trusted(x, 1).tolist() == [False, False]
+    assert drift.trusted(x, 2).tolist() == [False, True]
+
+
+def read_corrections(data):
+    day, n, count, *horizons = struct.unpack_from("<10s2xII4H", data)
+    at = struct.calcsize("<10s2xII4H")
+    norads = np.frombuffer(data, "<i4", n, at)
+    grid = np.frombuffer(data, "<i2", n * count * 3, at + 4 * n).reshape(n, count, 3)
+    misses = np.frombuffer(data, "<u2", n * 2, at + 4 * n + 6 * n * count).reshape(n, 2)
+    return day.decode(), horizons, norads, grid, misses
+
+
+def test_the_correction_file_is_empty_until_two_days_are_held():
+    day, horizons, norads, _, _ = read_corrections(drift.pack_corrections(daily([-1, 0]), TODAY, NETS))
+    assert day == TODAY.isoformat() and horizons == list(drift.FILE_HORIZONS) and len(norads) == 0
+
+
+def test_the_correction_file_holds_what_the_network_says_in_tenths_of_a_km():
+    held = daily([-3, -2, -1, 0])
+    data = drift.pack_corrections(held, TODAY, NETS)
+    _, _, norads, grid, misses = read_corrections(data)
+    assert len(data) == struct.calcsize("<10s2xII4H") + len(norads) * (4 + 6 * 4 + 4)
+    assert set(norads) == set(held[TODAY])
+    assert (misses < drift.NO_MISS).all()
+    known = drift.sets_by_object(held.values())
+    norad = int(norads[0])
+    epochs, rows = known[norad]
+    x = np.array([drift.features(epochs, rows, len(rows) - 1, 3)], np.float32)
+    direct = drift.correct(NETS, x, np.array([3.0], np.float32))[0]
+    assert grid[0, 1] / 10 == pytest.approx(direct, abs=0.051)
+
+
+def test_the_correction_file_does_not_read_later_snapshots():
+    held = daily([-3, -2, -1, 0, 1])
+    cut = {d: s for d, s in held.items() if d <= TODAY}
+    assert drift.pack_corrections(held, TODAY, NETS) == drift.pack_corrections(cut, TODAY, NETS)

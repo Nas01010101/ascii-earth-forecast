@@ -23,6 +23,7 @@ CHUNK = 100
 CALLS_PER_MINUTE = 500
 BOOTSTRAP_DAYS = 45
 FORECAST_DAYS = 2
+JSON_TRIES = 3
 MIN_SATELLITES = 5000
 
 
@@ -46,6 +47,18 @@ def get(url, tries=4, wait=20):
         if attempt < tries - 1:
             time.sleep(wait * 2**attempt)
     raise SourceError(f"{url[:60]}: {failure}")
+
+
+def get_json(url):
+    """Parsed JSON from url. A connection dropped mid-body can still end as a clean read, so a cut body is fetched again."""
+    for attempt in range(JSON_TRIES):
+        try:
+            return json.loads(get(url))
+        except ValueError as err:
+            failure = err
+        if attempt < JSON_TRIES - 1:
+            time.sleep(20)
+    raise SourceError(f"{url[:60]}: invalid JSON: {failure}")
 
 
 def cells():
@@ -99,10 +112,7 @@ def weather(past_days, pause=time.sleep):
     for start in range(0, len(points), CHUNK):
         if start:
             pause(60 * calls / CALLS_PER_MINUTE)
-        try:
-            body = json.loads(get(weather_url(points[start : start + CHUNK], past_days)))
-        except ValueError as err:
-            raise SourceError(f"weather: invalid JSON: {err}") from err
+        body = get_json(weather_url(points[start : start + CHUNK], past_days))
         payloads += body if isinstance(body, list) else [body]
     return parse_weather(payloads, (len(LATS), len(LONS)))
 

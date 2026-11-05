@@ -6,6 +6,7 @@ would have been issued on it. The formulas match research/sat, and research/sat/
 checks them against the training code.
 """
 import math
+import struct
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -26,6 +27,10 @@ EARTH_RADIUS_KM = 6378.135
 MU = 398600.8  # WGS72, km^3/s^2, the constant SGP4 uses here
 MAX_DRIFT_KM = 40000.0  # a diverged hindcast implies drifts up to 1e13 km
 NETWORK_ROWS = 65536
+MIN_HELD_DAYS = 2  # research/sat/history_check.py: under this the network misses by more than SGP4
+FILE_HORIZONS = (1, 3, 7, 15)  # what the viewer interpolates between; training covered 1 to 30 days
+FILE_TENTHS_KM = 10.0
+NO_MISS = 65535
 
 ELEMENTS = ["no_rev", "ecco", "inclo", "sin_argp", "cos_argp", "bstar", "ndot", "nddot", "perigee_km", "apogee_km", "updates_30d"]
 HISTORY = [f"{name}_{int(a)}" for a in LOOKBACKS for name in ("age", "height", "along", "cross", "dno", "dbstar")]
@@ -130,6 +135,7 @@ def inputs(x, dt):
     """Network inputs: compressed features, the horizon, the drift estimate, and one missing flag per lookback."""
     missing = ~np.isfinite(x)
     out = np.nan_to_num(x.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    out[:, [INDEX[name] for name in WEATHER]] = 0.0  # real values saturate a network trained on zeros
     for name in LOGGED:
         out[:, INDEX[name]] = _slog(out[:, INDEX[name]])
     for name in RATES:
@@ -188,6 +194,13 @@ def correct(nets, x, dt):
     return np.mean(parts, axis=0)
 
 
+def trusted(x, held_days):
+    """Rows the network may correct: the job holds enough days, and the object has at least one lookback."""
+    if held_days < MIN_HELD_DAYS:
+        return np.zeros(len(x), dtype=bool)
+    return np.isfinite(x[:, [INDEX[name] for name in AGES]]).any(axis=1)
+
+
 def miss_km(radius, truth, correction):
     """3D distance between the true point and the corrected point, both as (height, along, cross) in km."""
     def point(d):
@@ -197,12 +210,12 @@ def miss_km(radius, truth, correction):
     return np.linalg.norm(point(truth) - point(correction), axis=1)
 
 
-def score_start(known, start, horizon, held_days, nets):
-    """Scores forecasts that start from the sets in one snapshot, against the first later set past the horizon.
+def _checked(known, start, horizon, held_days, nets):
+    """Forecasts from the sets in one snapshot against the first later set past the horizon.
 
-    Returns {n, sgp4_km, model_km}, medians, or None if no satellite has a usable later set.
+    Returns (norads, SGP4 miss km, published miss km, whether the network corrected it), or None if none has a later set.
     """
-    x, truth, radius = [], [], []
+    norads, x, truth, radius = [], [], [], []
     for norad, row in start.items():
         if norad not in known:
             continue
@@ -214,6 +227,7 @@ def score_start(known, start, horizon, held_days, nets):
         found = _error(orbits.satrec(rows[i]), orbits.satrec(rows[j]), float(epochs[j] - epochs[i]))
         if found is None:
             continue
+        norads.append(norad)
         x.append(features(epochs, rows, i, held_days))
         truth.append(found[:3])
         radius.append(found[3])
@@ -221,10 +235,22 @@ def score_start(known, start, horizon, held_days, nets):
         return None
     x = np.array(x, dtype=np.float32)
     truth, radius = np.array(truth), np.array(radius)
-    corrected = correct(nets, x, np.full(len(x), float(horizon), np.float32)).astype(np.float64)
-    raw = miss_km(radius, truth, np.zeros_like(truth))
-    return {"n": len(x), "sgp4_km": round(float(np.median(raw)), 2),
-            "model_km": round(float(np.median(miss_km(radius, truth, corrected))), 2)}
+    use = trusted(x, held_days)
+    corrected = correct(nets, x, np.full(len(x), float(horizon), np.float32)).astype(np.float64) * use[:, None]
+    return norads, miss_km(radius, truth, np.zeros_like(truth)), miss_km(radius, truth, corrected), use
+
+
+def score_start(known, start, horizon, held_days, nets):
+    """Scores forecasts that start from the sets in one snapshot. Objects the network may not correct count at their SGP4 miss.
+
+    Returns {n, corrected, sgp4_km, model_km}, medians, or None if no satellite has a usable later set.
+    """
+    found = _checked(known, start, horizon, held_days, nets)
+    if found is None:
+        return None
+    _, raw, model, use = found
+    return {"n": len(raw), "corrected": int(use.sum()), "sgp4_km": round(float(np.median(raw)), 2),
+            "model_km": round(float(np.median(model)), 2)}
 
 
 def score_day(snapshots, day, nets):
@@ -238,3 +264,36 @@ def score_day(snapshots, day, nets):
         if found:
             out[str(horizon)] = found
     return out
+
+
+def pack_corrections(snapshots, day, nets):
+    """Packs the network's corrections for the sets in a day's snapshot, and how each object's last forecast did.
+
+    Layout, little-endian, aligned for typed arrays: date (10 ASCII bytes), 2 pad, n uint32, horizon count uint32,
+    4 horizons uint16 (days), then norad int32[n], int16[n, horizons, 3] (height, along, cross in tenths of a km), and
+    uint16[n, 2] (1-day miss in tenths of a km, SGP4 then network; NO_MISS when not checked). Untrusted objects are left out.
+    """
+    held = sorted(d for d in snapshots if d <= day)
+    known = sets_by_object([snapshots[d] for d in held])
+    held_days = (day - held[0]).days
+    norads, x = [], []
+    for norad, row in snapshots[day].items():
+        epochs, rows = known[norad]
+        i = int(np.searchsorted(epochs, epoch_day(row)))
+        norads.append(norad)
+        x.append(features(epochs, rows, i, held_days))
+    x = np.array(x, dtype=np.float32).reshape(-1, len(FEATURES))
+    use = trusted(x, held_days)
+    norads, x = [n for n, keep in zip(norads, use, strict=True) if keep], x[use]
+    grid = np.stack([correct(nets, x, np.full(len(x), float(h), np.float32)) for h in FILE_HORIZONS], axis=1) if len(x) else np.zeros((0, len(FILE_HORIZONS), 3))
+    misses = np.full((len(x), 2), NO_MISS, dtype=np.uint16)
+    begun = day - timedelta(days=1)
+    checked = _checked(known, snapshots[begun], 1, (begun - held[0]).days, nets) if begun in snapshots else None
+    if checked:
+        where = {norad: k for k, norad in enumerate(norads)}
+        for norad, raw, model in zip(checked[0], checked[1], checked[2], strict=True):
+            if norad in where:
+                misses[where[norad]] = np.clip(np.round(np.array([raw, model]) * FILE_TENTHS_KM), 0, NO_MISS - 1)
+    header = struct.pack("<10s2xII4H", day.isoformat().encode(), len(x), len(FILE_HORIZONS), *FILE_HORIZONS)
+    tenths = np.clip(np.round(grid * FILE_TENTHS_KM), -32767, 32767).astype("<i2")
+    return header + np.array(norads, dtype="<i4").tobytes() + tenths.tobytes() + misses.astype("<u2").tobytes()

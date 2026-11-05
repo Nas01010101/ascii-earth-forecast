@@ -3,6 +3,8 @@ name: daily
 on:
   schedule:
     - cron: "37 1 * * *"
+    # GitHub can drop a scheduled run. This one fetches only what the first did not finish.
+    - cron: "37 7 * * *"
   workflow_dispatch:
 
 permissions:
@@ -33,11 +35,14 @@ jobs:
       - id: forecast
         run: python -m forecast data
         continue-on-error: true
+      # The data branch keeps yesterday's files when today's could not be read.
+      - run: python -m forecast.check data
       - run: scripts/data_branch.sh publish "$REMOTE" "$PWD/data"
         env:
           REMOTE: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
       # GitHub disables scheduled workflows after 60 days without repository activity.
-      - run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/daily.yml/enable"
+      - if: always()
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/daily.yml/enable"
         env:
           GH_TOKEN: ${{ github.token }}
         continue-on-error: true

@@ -68,9 +68,7 @@ def download(url: str, names: dict, first: date, last: date, cache: str, pause=t
     for start in range(0, len(points), CHUNK):
         path = folder / f"{start}.json"
         if not path.exists():
-            body = fetch.get(query(url, points[start:start + CHUNK], names, first, last))
-            json.loads(body)
-            path.write_bytes(body)
+            path.write_text(json.dumps(fetch.get_json(query(url, points[start:start + CHUNK], names, first, last))))
             pause(wait)
         payloads += json.loads(path.read_text())
     return to_grid(payloads, names, first, last)

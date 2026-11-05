@@ -138,3 +138,19 @@ def test_locations_with_different_hours_are_rejected():
     bad[3] = {"hourly": {**bad[3]["hourly"], "time": ["2026-11-03T00:00", "2026-11-03T01:00"]}}
     with pytest.raises(fetch.SourceError):
         fetch.parse_weather(bad, SHAPE)
+
+
+def test_a_body_cut_inside_a_good_response_is_fetched_again(monkeypatch):
+    bodies = [b'[{"hourly": {"cl', b'[{"hourly": 1}]']
+    monkeypatch.setattr(fetch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fetch, "get", lambda url: bodies.pop(0))
+    assert fetch.get_json("http://x") == [{"hourly": 1}]
+
+
+def test_a_body_that_stays_cut_fails_the_source(monkeypatch):
+    tries = []
+    monkeypatch.setattr(fetch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(fetch, "get", lambda url: tries.append(url) or b"[1,")
+    with pytest.raises(fetch.SourceError, match="invalid JSON"):
+        fetch.get_json("http://x")
+    assert len(tries) == fetch.JSON_TRIES

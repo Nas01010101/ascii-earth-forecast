@@ -16,6 +16,10 @@ Decisions a reader cannot get from the code, and what each one gives up.
 | Network trained on the public catalogue, run on the active list | The catalogue gives 9 years of history; the active list has none | CelesTrak's active list leaves out debris, so the published loss may differ from the research numbers |
 | Past forecasts kept in `forecasts.npz`, first entry of a day wins | A published forecast can be scored later without predicting again; a ridge forecast stays a ridge forecast after the network arrives | Days before the archive began are replays, marked `issued: false`; the file grows by one day of grids per run |
 | Output on a one-commit `data` branch | Repository stays small; the site reads raw files with no server | No version history of past runs, apart from `forecasts.npz` |
+| Network corrections only with two days of held sets and a lookback | `research/sat/history_check.py` on 2025: with no lookback the median miss at 3 days is 4.97 km against SGP4's 3.49; with two days held it is 3.33 | The published score equals SGP4 for the first two days of a new data branch |
+| `corrections.bin` holds 1, 3, 7 and 15 day corrections per object | The viewer shows a network position for any later time without running the network in the browser | About 32 bytes per object, 16 s a day on two threads |
+| Two scheduled runs a day, each skips what is done | GitHub can drop a scheduled run; a failed source is retried without fetching the other again | A code change made after the day's run first shows in the next day's run |
+| `forecast.check` before publishing | A file the site cannot read never replaces the last good one | A failed check leaves the data branch a day old |
 | One failure per source | A CelesTrak outage does not stop the weather | The page can show sections of different ages, and says so |
 
 ## Assumptions not yet checked against a live run
