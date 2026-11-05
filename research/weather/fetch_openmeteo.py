@@ -2,9 +2,11 @@
 
 usage: fetch_openmeteo.py fields OUT.npz FIRST LAST FIRST_TARGET CACHE_DIR
        fetch_openmeteo.py forecast OUT.npz FIRST LAST CACHE_DIR
+       fetch_openmeteo.py lagged OUT.npz FIRST LAST CACHE_DIR
 `fields` reads the historical forecast endpoint, whose hours matched the job's forecast endpoint on all 1,080 hours
-compared at one point. `forecast` reads Open-Meteo's own forecast made a day earlier, for comparison only. Each chunk
-is cached, so a stopped download resumes.
+compared at one point. `forecast` reads Open-Meteo's own forecast made a day earlier, for comparison only. `lagged`
+adds the one made two days earlier, as inputs for a correction of those forecasts. Each chunk is cached, so a stopped
+download resumes.
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ FORECAST_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 HOURLY = {"cloud": "cloud_cover", "temp": "temperature_2m", "precip": "precipitation", "pressure": "pressure_msl",
           "speed": "wind_speed_10m", "direction": "wind_direction_10m", "water": "total_column_integrated_water_vapour"}
 LAST_RUN = {"cloud": "cloud_cover_previous_day1", "temp": "temperature_2m_previous_day1"}
+LAGGED = {**LAST_RUN, "cloud2": "cloud_cover_previous_day2"}
 CHUNK = 100
 HOURS_PER_STEP = 6
 # The free tier allows 5,000 calls an hour and bills a location 1 call per 14 days of data.
@@ -107,5 +110,11 @@ def forecast(out: str, first: str, last: str, cache: str) -> None:
     np.savez(out, first_date=first, cloud_day=day_means(hourly["cloud"]), temp_day=day_means(hourly["temp"]))
 
 
+def lagged(out: str, first: str, last: str, cache: str) -> None:
+    start, end = date.fromisoformat(first), date.fromisoformat(last)
+    hourly = download(FORECAST_URL, LAGGED, start, end, cache)
+    np.savez(out, first_date=first, **{f"{name}_day": day_means(field) for name, field in hourly.items()})
+
+
 if __name__ == "__main__":
-    {"fields": fields, "forecast": forecast}[sys.argv[1]](*sys.argv[2:])
+    {"fields": fields, "forecast": forecast, "lagged": lagged}[sys.argv[1]](*sys.argv[2:])
