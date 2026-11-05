@@ -231,8 +231,9 @@ def weather_section(days, history, forecasts, today):
             "net": net,
             "places": weather.at_places(cloud, temp),
             "map": picture(cloud, 100),
-            # Whole percent, south to north and west to east, for the viewer's cloud switch.
+            # Whole percent and whole degrees, south to north and west to east, for the viewer's map.
             "cloud": np.clip(cloud, *CLOUD_RANGE).round().astype(int).ravel().tolist(),
+            "temp": np.asarray(temp).round().astype(int).ravel().tolist(),
         },
         "last_scored": {"date": days[-1], "actual": picture(history[days[-1]][0], 100)},
     }

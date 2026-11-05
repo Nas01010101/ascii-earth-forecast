@@ -7,7 +7,7 @@ from datetime import date, timedelta
 import numpy as np
 import pytest
 
-from forecast import fetch, run
+from forecast import fetch, run, weather
 
 TODAY = date(2026, 11, 3)
 SHAPE = (len(fetch.LATS), len(fetch.LONS))
@@ -159,6 +159,32 @@ def test_today_carries_the_network_cloud_grid_as_whole_percent():
     assert len(grid) == cloud.size
     assert all(type(v) is int for v in grid)
     assert (grid[0], grid[1], grid[-1]) == (0, 40, 100)
+
+
+def test_today_carries_a_temperature_grid_in_whole_degrees():
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    history = {d: (field(90), field(0)) for d in days}
+    temp = field(4.6)
+    temp[0, 0], temp[-1, -1] = -31.4, 28.9
+    forecasts = {TODAY.isoformat(): (field(40), temp, True, True)}
+    grid = run.weather_section(days, history, forecasts, TODAY)["today"]["temp"]
+    assert len(grid) == temp.size
+    assert all(type(v) is int for v in grid)
+    assert (grid[0], grid[1], grid[-1]) == (-31, 5, 29)
+
+
+def test_the_page_reads_the_same_cell_from_the_grids_as_from_the_places():
+    days = [(TODAY - timedelta(days=d)).isoformat() for d in range(30, 0, -1)]
+    history = {d: (field(90), field(0)) for d in days}
+    rng = np.random.default_rng(3)
+    cloud, temp = rng.uniform(0, 100, SHAPE), rng.uniform(-20, 30, SHAPE)
+    forecasts = {TODAY.isoformat(): (cloud, temp, True, True)}
+    today = run.weather_section(days, history, forecasts, TODAY)["today"]
+    for place, lat, lon in weather.CELLS:
+        row, col = int(np.floor((lat + 90) / fetch.STEP)), int(np.floor((lon + 180) / fetch.STEP))
+        found = next(p for p in today["places"] if p["place"] == place)
+        assert abs(today["cloud"][row * SHAPE[1] + col] - found["cloud"]) <= 0.55
+        assert abs(today["temp"][row * SHAPE[1] + col] - found["temp"]) <= 0.55
 
 
 def test_a_field_with_too_many_missing_cells_keeps_the_ridge_and_says_so(tmp_path, monkeypatch):
