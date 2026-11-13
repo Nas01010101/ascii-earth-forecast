@@ -1,8 +1,15 @@
 # ascii-earth-forecast
 
-Daily weather and satellite position forecasts, scored against the past week. The output drives the clouds, rain and satellites on the ASCII planet at [nas01010101.github.io](https://nas01010101.github.io) and its [flow page](https://nas01010101.github.io/flow.html).
+Daily forecasts of the world's weather and of where every active satellite will be, drawn as text on [a planet in the browser](https://nas01010101.github.io/earth.html).
 
-![ASCII planet with satellites](docs/planet.png)
+[live page](https://nas01010101.github.io/earth.html) · [method](https://nas01010101.github.io/earth.html#method) · [data branch](https://github.com/Nas01010101/ascii-earth-forecast/tree/data)
+
+![The globe with every tracked satellite, and the forecast map coloured by height with cloud glyphs](docs/preview.png)
+
+| Forecast | Model | Scored against |
+|---|---|---|
+| cloud, temperature and pressure for today | U-Nets reading 30 days of 7 fields, run with numpy | repeating the day before |
+| satellite positions 1 to 30 days ahead | SGP4 plus a residual network's correction | SGP4 alone |
 
 ## Data flow
 
