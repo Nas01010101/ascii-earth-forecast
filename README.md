@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" width="220" alt="Hand drawing of the Earth with the UK as one dot, a stick figure labelled me, and a big spider on Australia"></p>
+
 # ascii-earth-forecast
 
 Daily forecasts of the world's weather and of where every active satellite will be, drawn as text on [a planet in the browser](https://nas01010101.github.io/earth.html).
