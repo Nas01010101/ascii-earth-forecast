@@ -82,7 +82,7 @@ The mean of both fields on the sealed days is 62.20% below the ridge, standard e
 
 ## Satellite network
 
-`forecast/drift.py` runs the network with numpy from `forecast/drift_weights.npz`. Training and evaluation code is in `research/sat`, on public element sets from 2017 to 2025.
+`forecast/drift.py` runs the network with numpy from `forecast/drift_weights.npz`. Training and evaluation code is in `research/sat`, on public element sets from 2017 to 2025. The shipped weights were fit on 2020 to 2025, on the objects whose catalogue number modulo 64 falls outside 16 to 31, three quarters of the catalogue (`research/sat/final_fit.py`, `train_net.py`).
 
 | Test, with weights trained through 2024 on the 2025 catalogue | 15-day improvement over SGP4, mean of objects' medians | 95% interval |
 |---|---|---|
@@ -99,7 +99,7 @@ On the three objects of [Liu et al. 2021](https://doi.org/10.26077/aspb-yk57), a
 | 3 | 45 of 47 | 2.95 km | 2.33 km |
 | 7 | 46 of 47 | 11.34 km | 6.76 km |
 
-Truth is SGP4 from a later published element set, not tracking data. Manoeuvres are not filtered out. The weights in this repository were refit on every labelled year through 2025, so they have no held-out test of their own; `satellites.losses` is theirs.
+Truth is SGP4 from a later published element set, not tracking data. Manoeuvres are not filtered out. The weights in this repository were refit on 2020 to 2025, so no year is held out for them; `satellites.losses` is their test.
 
 ## Output
 
