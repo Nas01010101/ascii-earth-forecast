@@ -25,6 +25,10 @@ BOOTSTRAP_DAYS = 45
 FORECAST_DAYS = 2
 JSON_TRIES = 3
 MIN_SATELLITES = 5000
+# ECMWF's AIFS Single, a machine-learned global forecast (weights CC BY 4.0), as served by Open-Meteo.
+# Only the fields the networks forecast, in the order run.py stores them.
+AIFS_MODEL = "ecmwf_aifs025_single"
+AIFS_VARIABLES = {name: VARIABLES[name] for name in ("cloud", "temp", "pressure")}
 
 
 class SourceError(RuntimeError):
@@ -67,20 +71,22 @@ def cells():
     return np.column_stack([lat.ravel(), lon.ravel()])
 
 
-def weather_url(points, past_days):
+def weather_url(points, past_days, names=VARIABLES, model=None, days=FORECAST_DAYS):
     query = {
         "latitude": ",".join(f"{v:g}" for v in points[:, 0]),
         "longitude": ",".join(f"{v:g}" for v in points[:, 1]),
-        "hourly": ",".join(VARIABLES.values()),
+        "hourly": ",".join(names.values()),
         "wind_speed_unit": "ms",
         "past_days": past_days,
-        "forecast_days": FORECAST_DAYS,
+        "forecast_days": days,
         "timezone": "UTC",
     }
+    if model:
+        query["models"] = model
     return f"{WEATHER_URL}?{urllib.parse.urlencode(query)}"
 
 
-def parse_weather(payloads, shape):
+def parse_weather(payloads, shape, names=VARIABLES):
     """Turns one JSON location list into hours and {name: (hours, lat, lon)} float32 arrays."""
     if len(payloads) != shape[0] * shape[1]:
         raise SourceError(f"weather: got {len(payloads)} locations")
@@ -91,7 +97,7 @@ def parse_weather(payloads, shape):
             raise SourceError("weather: locations disagree on the hours")
         hours = np.array(stamps, dtype="datetime64[h]")
         fields = {}
-        for name, api_name in VARIABLES.items():
+        for name, api_name in names.items():
             rows = [p["hourly"][api_name] for p in payloads]
             # float32 turns the API's nulls into NaN; ragged rows raise ValueError here.
             grid = np.array(rows, dtype=np.float32).T.reshape(len(hours), *shape)
@@ -104,17 +110,24 @@ def parse_weather(payloads, shape):
     return hours, fields
 
 
-def weather(past_days, pause=time.sleep):
-    """Downloads the whole grid in chunks, paced under the free tier's limit."""
+def weather(past_days, pause=time.sleep, names=VARIABLES, model=None, days=FORECAST_DAYS):
+    """Downloads the whole grid in chunks, paced under the free tier's limit. No model means Open-Meteo's default."""
     points = cells()
-    calls = CHUNK * max(1, (past_days + FORECAST_DAYS) / 14)
+    calls = CHUNK * max(1, (past_days + days) / 14)
     payloads = []
     for start in range(0, len(points), CHUNK):
         if start:
             pause(60 * calls / CALLS_PER_MINUTE)
-        body = get_json(weather_url(points[start : start + CHUNK], past_days))
+        body = get_json(weather_url(points[start : start + CHUNK], past_days, names, model, days))
         payloads += body if isinstance(body, list) else [body]
-    return parse_weather(payloads, (len(LATS), len(LONS)))
+    return parse_weather(payloads, (len(LATS), len(LONS)), names)
+
+
+def aifs(pause=time.sleep):
+    """Today's hours of AIFS cloud, temperature and pressure over the grid, as weather() returns them."""
+    # Follows the main download, whose last chunk went out unpaced.
+    pause(60 * CHUNK / CALLS_PER_MINUTE)
+    return weather(0, pause, AIFS_VARIABLES, AIFS_MODEL, days=1)
 
 
 def elements():

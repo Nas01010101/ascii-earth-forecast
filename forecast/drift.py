@@ -127,6 +127,10 @@ def own_drift(x, dt):
     return (c * dt.astype(np.float64) ** 2).astype(np.float32)
 
 
+def _columns(names):
+    return [INDEX[name] for name in names]
+
+
 def _slog(v):
     return np.sign(v) * np.log1p(np.abs(v))
 
@@ -135,18 +139,15 @@ def inputs(x, dt):
     """Network inputs: compressed features, the horizon, the drift estimate, and one missing flag per lookback."""
     missing = ~np.isfinite(x)
     out = np.nan_to_num(x.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    out[:, [INDEX[name] for name in WEATHER]] = 0.0  # real values saturate a network trained on zeros
-    for name in LOGGED:
-        out[:, INDEX[name]] = _slog(out[:, INDEX[name]])
-    for name in RATES:
-        out[:, INDEX[name]] = _slog(out[:, INDEX[name]] * 1e4)
+    out[:, _columns(WEATHER)] = 0.0  # real values saturate a network trained on zeros
+    out[:, _columns(LOGGED)] = _slog(out[:, _columns(LOGGED)])
+    out[:, _columns(RATES)] = _slog(out[:, _columns(RATES)] * 1e4)
     out[:, INDEX["no_rev"]] /= 16.0
     out[:, INDEX["inclo"]] /= 180.0
-    for name in AGES:
-        out[:, INDEX[name]] /= 30.0
+    out[:, _columns(AGES)] /= 30.0
     days = dt.astype(np.float64)
     extra = np.stack([np.log(days + 0.1), days / 30.0, _slog(own_drift(x, dt).astype(np.float64))], axis=1)
-    flags = missing[:, [INDEX[name] for name in AGES]].astype(np.float64)
+    flags = missing[:, _columns(AGES)].astype(np.float64)
     return np.concatenate([out, extra, flags], axis=1).astype(np.float32)
 
 
@@ -198,7 +199,7 @@ def trusted(x, held_days):
     """Rows the network may correct: the job holds enough days, and the object has at least one lookback."""
     if held_days < MIN_HELD_DAYS:
         return np.zeros(len(x), dtype=bool)
-    return np.isfinite(x[:, [INDEX[name] for name in AGES]]).any(axis=1)
+    return np.isfinite(x[:, _columns(AGES)]).any(axis=1)
 
 
 def miss_km(radius, truth, correction):
@@ -285,7 +286,9 @@ def pack_corrections(snapshots, day, nets):
     x = np.array(x, dtype=np.float32).reshape(-1, len(FEATURES))
     use = trusted(x, held_days)
     norads, x = [n for n, keep in zip(norads, use, strict=True) if keep], x[use]
-    grid = np.stack([correct(nets, x, np.full(len(x), float(h), np.float32)) for h in FILE_HORIZONS], axis=1) if len(x) else np.zeros((0, len(FILE_HORIZONS), 3))
+    grid = np.zeros((0, len(FILE_HORIZONS), 3))
+    if len(x):
+        grid = np.stack([correct(nets, x, np.full(len(x), float(h), np.float32)) for h in FILE_HORIZONS], axis=1)
     misses = np.full((len(x), 2), NO_MISS, dtype=np.uint16)
     begun = day - timedelta(days=1)
     checked = _checked(known, snapshots[begun], 1, (begun - held[0]).days, nets) if begun in snapshots else None

@@ -57,7 +57,7 @@ def test_grid_is_1152_cells_in_chunks_within_budget(monkeypatch):
     calls, waits = [], []
     body = lambda n: json.dumps(payloads()[:1] * n).encode()
     monkeypatch.setattr(fetch, "get", lambda url: (calls.append(url), body(url.split("latitude=")[1].split("&")[0].count("%2C") + 1))[1])
-    monkeypatch.setattr(fetch, "parse_weather", lambda p, shape: len(p))
+    monkeypatch.setattr(fetch, "parse_weather", lambda p, shape, names: len(p))
     assert fetch.weather(45, pause=waits.append) == 1152
     assert len(calls) == 12
     billed = 1152 * 46 / 14

@@ -1,6 +1,6 @@
 """Writes a synthetic data directory for browser tests of the site. Its scores mean nothing; never publish it."""
 import sys, gzip, json
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import numpy as np
 from forecast import fetch, run

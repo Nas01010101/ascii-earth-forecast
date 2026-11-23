@@ -21,6 +21,7 @@ Decisions a reader cannot get from the code, and what each one gives up.
 | `corrections.bin` holds 1, 3, 7 and 15 day corrections per object | The viewer shows a network position for any later time without running the network in the browser | 28 byte header plus 32 bytes per object: 539,036 bytes and 18.1 s on two threads for 16,844 objects, peak RSS 274 MB. The browser interpolates between horizons in dt², whose gap to the direct answer at p90 is 19-67% of a linear one |
 | Two scheduled runs a day, each skips what is done | GitHub can drop a scheduled run; a failed source is retried without fetching the other again | A code change made after the day's run first shows in the next day's run |
 | `forecast.check` before publishing | A file the site cannot read never replaces the last good one | A failed check leaves the data branch a day old |
+| ECMWF AIFS Single through Open-Meteo, kept in `aifs.npz` and scored next to the networks | An open machine-learned global forecast, CC BY 4.0, read with the same API and no GPU; the losses show how far the networks are from it | 1,152 more calls a day, which can pass the hourly limit on a first run; a failed download is a warning and that day has no AIFS score. Its hourly values are interpolated from 6-hourly steps |
 | One failure per source | A CelesTrak outage does not stop the weather | The page can show sections of different ages, and says so |
 
 ## Assumptions not yet checked against a live run

@@ -5,12 +5,14 @@ import math
 import struct
 from datetime import datetime, timezone
 
+import numpy as np
 from sgp4.api import Satrec
 from sgp4 import omm
 
 MAX_DROPPED = 0.05
-NUMERIC = ("MEAN_MOTION", "ECCENTRICITY", "INCLINATION", "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY",
-           "MEAN_MOTION_DOT", "BSTAR")
+PACKED = ("MEAN_MOTION", "ECCENTRICITY", "INCLINATION", "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY",
+          "MEAN_MOTION_DOT")
+NUMERIC = PACKED + ("BSTAR",)
 
 
 def parse(text):
@@ -51,12 +53,7 @@ def clean(text):
 def pack(text):
     """Packs CSV elements into the site's sats.bin: a float64 base epoch, then eight float32s per satellite."""
     rows = list(csv.DictReader(io.StringIO(text)))
-    def epoch_ms(row):
-        return datetime.fromisoformat(row["EPOCH"]).replace(tzinfo=timezone.utc).timestamp() * 1000
-    base = max(epoch_ms(r) for r in rows)
-    out = bytearray(struct.pack("<d", base))
-    for r in rows:
-        out += struct.pack("<8f", (epoch_ms(r) - base) / 1000, float(r["MEAN_MOTION"]), float(r["ECCENTRICITY"]),
-                           float(r["INCLINATION"]), float(r["RA_OF_ASC_NODE"]), float(r["ARG_OF_PERICENTER"]),
-                           float(r["MEAN_ANOMALY"]), float(r["MEAN_MOTION_DOT"]))
-    return bytes(out)
+    epoch_ms = np.array([datetime.fromisoformat(r["EPOCH"]).replace(tzinfo=timezone.utc).timestamp() * 1000 for r in rows])
+    base = epoch_ms.max()
+    table = np.column_stack([(epoch_ms - base) / 1000, [[float(r[k]) for k in PACKED] for r in rows]])
+    return struct.pack("<d", base) + table.astype("<f4").tobytes()

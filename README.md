@@ -13,123 +13,90 @@ Daily forecasts of the world's weather and of where every active satellite will 
 | cloud, temperature and pressure for today | U-Nets reading 30 days of 7 fields, run with numpy | repeating the day before |
 | satellite positions 1 to 30 days ahead | SGP4 plus a residual network's correction | SGP4 alone |
 
-## Data flow
+## How it works
+
+- **Weather.** Open-Meteo hourly fields on a 7.5 degree grid (1,152 cells) become UTC daily means and 6-hourly steps. Frozen U-Nets read the last 30 days of steps and forecast today's mean cloud cover, temperature and pressure; a ridge regression stands in for cloud and temperature when a day of steps is missing.
+- **Satellites.** One CelesTrak snapshot of the active elements a day. SGP4 propagates each object, and a frozen residual network corrects its height, along-track and cross-track error from the object's own recent element sets.
+- **Scoring.** Weather forecasts are kept and scored once their day has finished, by area-weighted squared error over the last 28 days. Satellite forecasts are scored by median miss in km at 1, 3 and 7 days, reading only the element sets held when they started. A day missed by the job is replayed from earlier stored data and marked `issued: false`. ECMWF's AIFS forecast is scored next to the weather networks as a reference.
+- **Failures.** Each source fails on its own: its last good section stays in `forecast.json` and `status` records the error. Stored days are never rewritten, and a day left out for missing data is fetched again on the next run.
+
+Training code is in `research/weather` and `research/sat`. Test results are in [docs/results.md](docs/results.md), design decisions in [docs/design.md](docs/design.md).
+
+## Architecture
+
+Three kinds of trained network run each day, all with numpy from frozen weights. The weather networks forecast today's daily mean; the satellite network corrects SGP4.
 
 ```
-weather                                satellites
+weather U-Net (forecast/cloudnet.py)
 
-Open-Meteo forecast API                CelesTrak active elements
-1,152 cells on a 7.5 degree grid       one CSV snapshot a day
-  |                                      |
-  v                                      v
-validate                               validate
-ranges, shape, under 1% missing        header, row count, drops rows
-                                       SGP4 cannot read
-  |                                      |
-  v                                      v
-preprocess                             preprocess
-7 fields: UTC daily means and          each object's element sets, oldest
-6-hourly steps                         first, and 45 inputs from them
-  |                                      |
-  v                                      v
-predict                                predict
-cloud, temperature, pressure: U-Nets   SGP4 from elements 1, 3 and 7 days
-reading 30 days, frozen; ridge for     old, plus a residual network: 6
-cloud and temp if days are missing     blocks, 256 wide, mean of 3, frozen
-  |                                      |
-  v                                      v
-actual                                 actual
-the stored daily means, once the day   SGP4 from the first newer set past
-has finished                           the horizon, at its epoch
-  |                                      |
-  v                                      v
-score                                  score
-kept forecasts, last 28 days, area-    median distance in km, against
-weighted squared error, against        SGP4 alone
-repeating the day before
+input  62 channels on the 24 x 48 grid (7.5 degrees)
+       7 fields x (4 six-hourly steps of the last day + 3 daily means)   49
+       30-day mean of cloud and temperature                               2
+       land-sea mask, surface height, sin and cos latitude                4
+       sin and cos day of year, the target's climatology                  3
+       learned position channels                                          4
+  |
+down   residual block, halve, x4      24x48 -> 12x24 -> 6x12 -> 3x6
+  |      cloud widths 64 128 256 256, temperature and pressure 32 64 128 128
+up     double, concatenate the skip, residual block, x3   back to 24x48
+  |
+out    1x1 conv: the change from climatology + the 30-day anomaly
+
+residual block: 3x3 conv, norm, GELU, 3x3 conv, norm, + 1x1 skip, GELU
+longitude wraps around, latitude repeats its edge row
+cloud: 1 network; temperature and pressure: mean of 3 each
 ```
 
-## Scoring
+```
+satellite residual network (forecast/drift.py)
 
-- **Weather.** Each run keeps that day's forecast of cloud cover, 2 m temperature and pressure in `forecasts.npz`, and `weather.losses` scores the kept forecasts of the last 28 finished days against what happened and against repeating the day before. The loss is the area-weighted squared error. A row has `issued: true` when the forecast was kept on the day it was made and `issued: false` when it was replayed from stored days because no forecast was kept then, and `net: true` when the network made its cloud map rather than the ridge. A replay uses only earlier days, and a kept forecast is never rewritten.
-- **Satellites.** Each day, `satellites.losses` scores the forecasts that started 1, 3 and 7 days earlier: the median distance in km of SGP4 alone and of SGP4 with the network's correction. A forecast reads only the element sets held when it started. A row has `issued: true` when it was scored on its own day and `issued: false` when it was replayed from stored snapshots after a missed run.
-
-"Actual" is a public reference with its own error, which these scores do not include. For weather it is Open-Meteo's model output for past hours, not station readings. For satellites it is SGP4 run from the newest published elements, not a tracking measurement.
-
-## Weather network
-
-`forecast/cloudnet.py` runs a U-Net with numpy from `forecast/cloud_weights.npz`: 5,114,817 weights, stored as 16-bit floats. It reads 7 fields over the past 30 days (cloud, temperature, rain, pressure, wind east and north, water vapour) and predicts the day's mean cloud cover. Training and evaluation code is in `research/weather`, on ERA5 from WeatherBench 2: trained on 1979 to 2018, checked on 2019 and 2020, tested on a sealed 2021 and 2022.
-
-| Test | Cloud loss | Below the ridge |
-|---|---|---|
-| Sealed ERA5 holdout, 2021 and 2022 | | 48.48% (standard error 0.38) |
-| 28 stored Open-Meteo days, 2026-10-07 to 2026-11-03, network | 374.3 | 18.0% |
-| Same days, ridge | 456.3 | |
-| Same days, repeating the day before | 647.0 | |
-| Same days, Open-Meteo's own forecast made a day earlier | 172.1 | |
-
-The Open-Meteo forecast is a reference and not a fair bar: it is scored against output of the same system. The gap between 48% and 18% is not fully explained. The stored days are point values at 7.5 degree cells and the network trained on ERA5's 1.5 degree area means, and the Open-Meteo fields have a wider spread than ERA5's (cloud standard deviation 1.36 times ERA5's), with no sign of a unit error. `weather.losses` is the test of the kept forecasts.
-
-`forecast/temp_weights.npz` and `forecast/pressure_weights.npz` hold three U-Nets each, 1,294,049 weights per network, reading the same 7 fields over the same 30 days. Each was trained on ERA5, then fine-tuned on 30 Open-Meteo days from 2026-07-18, stopping on the next 15. A forecast is the mean of the three. The weights are the ones scored below, not refit on the test days.
-
-| Test against the ridge fed 24-hour means | Temperature | Pressure |
-|---|---|---|
-| Sealed Open-Meteo days, 2026-10-07 to 2026-11-03 | 61.42% below | 62.99% below |
-| Selection days, 2026-09-01 to 2026-10-06 | 64.36% below | 63.60% below |
-| Selection days, Open-Meteo's own forecast made a day earlier | 89.72% below | not fetched |
-
-The mean of both fields on the sealed days is 62.20% below the ridge, standard error 0.75.
-
-## Satellite network
-
-`forecast/drift.py` runs the network with numpy from `forecast/drift_weights.npz`. Training and evaluation code is in `research/sat`, on public element sets from 2017 to 2025. The shipped weights were fit on 2020 to 2025, on the objects whose catalogue number modulo 64 falls outside 16 to 31, three quarters of the catalogue (`research/sat/final_fit.py`, `train_net.py`).
-
-| Test, with weights trained through 2024 on the 2025 catalogue | 15-day improvement over SGP4, mean of objects' medians | 95% interval |
-|---|---|---|
-| Sealed holdout, every published set | 30.21% | 24.85 to 34.46 |
-| Same year, sets as a once-a-day job holds them | 28.8% | 24.25 to 32.39 |
-
-On the three objects of [Liu et al. 2021](https://doi.org/10.26077/aspb-yk57), a network from the same recipe trained on 2017 and 2018 improved the 15-day miss by 21.04% (13.23 to 27.54) from 2019 to mid 2020. The mean of that paper's 15-day table is 29.3%, and it describes no separate test period. The catalogue numbers are a different test and do not compare with it.
-
-`research/sat/replay_check.py` runs the daily job's scorer on 47 weekly days of 2025, on an eighth of the catalogue, with the weights trained through 2024:
-
-| Days ahead | Days the network beat SGP4 | Median miss, SGP4 | Median miss, network |
-|---|---|---|---|
-| 1 | 32 of 47 | 0.77 km | 0.70 km |
-| 3 | 45 of 47 | 2.95 km | 2.33 km |
-| 7 | 46 of 47 | 11.34 km | 6.76 km |
-
-Truth is SGP4 from a later published element set, not tracking data. Manoeuvres are not filtered out. The weights in this repository were refit on 2020 to 2025, so no year is held out for them; `satellites.losses` is their test.
-
-## Output
-
-A GitHub Actions job runs once a day and force-pushes the `data` branch, which holds a single commit:
-
-| File | Contents |
-|---|---|
-| `forecast.json` | per-source status, today's ASCII map, its forecast at three cells and the model that made it (`weather.today`), the last finished day's map (`weather.last_scored`), the loss of past forecasts (`weather.losses`), and the satellite loss (`satellites.losses`) |
-| `planet.bin` | cloud and rain grids every 3 hours for today and tomorrow, read by the planet |
-| `sats.bin` | satellite elements for the browser |
-| `history.npz` | up to 60 days of daily means |
-| `steps.npz` | 38 days of the 7 fields, every 6 hours, read by the network |
-| `forecasts.npz` | every forecast kept so far, by day, with its `issued` and `net` flags |
-| `elements/` | up to 38 daily element snapshots |
-
-If one source fails, its last good section stays in `forecast.json` and `status` records the failure and the date of that section. This covers any exception in a source. The job exits non-zero only when both sources fail. Stored days are never rewritten; a day left out for missing data is requested again on the next run. Design decisions: [docs/design.md](docs/design.md).
+input  45 numbers per object and horizon
+       11 from the current element set (mean motion, eccentricity,
+          inclination, argument of perigee, perigee and
+          apogee height, drag terms, updates in 30 days)
+       24 from SGP4 hindcasts 1, 3, 7 and 15 days back (age, height,
+          along-track and cross-track error, change in mean motion and drag)
+       3 space-weather slots, held at zero
+       horizon (2 forms), the object's own along-track drift, 4 missing flags
+  |
+       linear to 256
+       6 x (layer norm, linear, GELU, linear, + skip)
+       layer norm, linear to 4
+  |
+out    height, along-track and cross-track correction in km
+       along-track = a x the object's own drift + b x its scale
+       mean of 3 networks, added to the SGP4 position
+```
 
 ## Run
 
 ```sh
 pip install ".[test]"
 python -m pytest
-python -m forecast data
+python -m forecast data         # one daily update into ./data
+python -m forecast.check data   # exits 1 if the site could not read a file
 ```
 
-`python -m forecast data` writes to `./data`. The first run downloads 45 days of weather, about 3,900 billed Open-Meteo calls at 500 a minute.
+The first run downloads 45 days of weather, about 3,900 billed Open-Meteo calls at 500 a minute; the AIFS download adds 1,152 a day and only warns when it fails. A GitHub Actions job runs the update twice a day, skips sources already done that day, and publishes `data/` with `scripts/data_branch.sh` as the single commit of the `data` branch.
+
+## Published files
+
+| File | Contents |
+|---|---|
+| `forecast.json` | per-source status; today's ASCII map, grids, forecast at three cells and the networks that made it (`weather.today`); the AIFS grids with model name and licence (`weather.today.aifs`); the last finished day's map (`weather.last_scored`); past forecast losses (`weather.losses`, `satellites.losses`) |
+| `planet.bin` | header `<dHHHH` (start ms, frame count, hours per frame, rows, cols), then uint8 cloud percent and uint8 rain in tenths of a mm/h, every 3 hours for today and tomorrow |
+| `sats.bin` | float64 base epoch in ms, then 8 float32 per satellite: epoch offset in seconds and 7 mean elements |
+| `corrections.bin` | header `<10s2xII4H` (date, count, horizon count, horizons 1, 3, 7, 15 days), then int32 NORAD ids, int16 height, along and cross corrections in tenths of a km per horizon, and uint16 1-day misses of SGP4 and the network |
+| `history.npz` | up to 60 days of daily mean cloud and temperature |
+| `steps.npz` | 38 days of the 7 fields, every 6 hours, read by the networks |
+| `forecasts.npz` | every forecast kept so far, by day, with its `issued`, `net` and `temp_net` flags and pressure |
+| `aifs.npz` | AIFS daily means of cloud, temperature and pressure for the last 29 days |
+| `elements/` | up to 38 daily element snapshots |
 
 ## Sources
 
 - Weather data by [Open-Meteo](https://open-meteo.com/), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The free API is for non-commercial use.
+- AIFS Single forecast by [ECMWF](https://www.ecmwf.int/), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), served by Open-Meteo.
 - Orbital elements by [CelesTrak](https://celestrak.org/NORAD/elements/).
 
 Code: MIT.

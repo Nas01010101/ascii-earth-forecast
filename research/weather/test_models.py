@@ -161,10 +161,6 @@ def test_a_climatology_file_runs_through_the_judge_as_the_base_forecast(tmp_path
     assert len(score.losses(model, data)["2021Q1"]) == 90
 
 
-if __name__ == "__main__":
-    pytest.main([__file__])
-
-
 def _varied(seed=3):
     """Every field different, so a target reading the wrong field cannot pass."""
     rng = np.random.default_rng(seed)

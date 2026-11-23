@@ -35,72 +35,68 @@ def write_atomic(path, data):
     os.replace(temp, path)
 
 
-def load_history(root):
-    path = root / "history.npz"
+def _load(path):
+    """Every array in an npz file, or {} if there is no file. NpzFile decompresses on every access, so each is read once."""
     if not path.exists():
         return {}
-    # NpzFile decompresses on every access, so each array is read once.
     with np.load(path) as saved:
-        days, cloud, temp = saved["days"], saved["cloud"], saved["temp"]
-    return {str(d): (cloud[i], temp[i]) for i, d in enumerate(days)}
+        return {name: saved[name] for name in saved.files}
+
+
+def _save(path, **arrays):
+    temp = path.with_name(path.stem + ".tmp.npz")
+    np.savez_compressed(temp, **arrays)
+    os.replace(temp, path)
+
+
+def load_history(root):
+    saved = _load(root / "history.npz")
+    return {str(d): (cloud, temp) for d, cloud, temp in zip(*(saved.get(k, ()) for k in ("days", "cloud", "temp")))}
 
 
 def save_history(root, history):
     days = sorted(history)
-    temp = root / "history.tmp.npz"
-    np.savez_compressed(temp, days=np.array(days),
-                        cloud=np.stack([history[d][0] for d in days]),
-                        temp=np.stack([history[d][1] for d in days]))
-    os.replace(temp, root / "history.npz")
+    _save(root / "history.npz", days=np.array(days),
+          cloud=np.stack([history[d][0] for d in days]), temp=np.stack([history[d][1] for d in days]))
 
 
 def load_forecasts(root):
-    path = root / "forecasts.npz"
-    if not path.exists():
+    saved = _load(root / "forecasts.npz")
+    if not saved:
         return {}
-    with np.load(path) as saved:
-        days, cloud, temp, issued = saved["days"], saved["cloud"], saved["temp"], saved["issued"]
-        # Forecasts stored before the network have no flag, and all came from the ridge.
-        net = saved["net"] if "net" in saved.files else np.zeros(len(days), dtype=bool)
-        # Forecasts stored before the temperature and pressure networks have neither.
-        temp_net = saved["temp_net"] if "temp_net" in saved.files else np.zeros(len(days), dtype=bool)
-        pressure = saved["pressure"] if "pressure" in saved.files else np.full((len(days), 1, 1), np.nan)
-    return {str(d): Forecast(cloud[i], temp[i], bool(issued[i]), bool(net[i]),
+    n = len(saved["days"])
+    # Files from before the networks have no flags, as every forecast then came from the ridge, and no pressure.
+    net = saved.get("net", np.zeros(n, dtype=bool))
+    temp_net = saved.get("temp_net", np.zeros(n, dtype=bool))
+    pressure = saved.get("pressure", np.full((n, 1, 1), np.nan))
+    return {str(d): Forecast(saved["cloud"][i], saved["temp"][i], bool(saved["issued"][i]), bool(net[i]),
                              None if np.isnan(pressure[i]).all() else pressure[i], bool(temp_net[i]))
-            for i, d in enumerate(days)}
+            for i, d in enumerate(saved["days"])}
 
 
 def save_forecasts(root, forecasts):
     days = sorted(forecasts)
-    temp = root / "forecasts.tmp.npz"
     made = [Forecast(*forecasts[d]) for d in days]
     empty = np.full(np.shape(made[0].cloud), np.nan)
-    np.savez_compressed(temp, days=np.array(days),
-                        cloud=np.stack([forecasts[d][0] for d in days]).astype(np.float32),
-                        temp=np.stack([forecasts[d][1] for d in days]).astype(np.float32),
-                        issued=np.array([forecasts[d][2] for d in days]),
-                        net=np.array([forecasts[d][3] for d in days]),
-                        temp_net=np.array([f.temp_net for f in made]),
-                        pressure=np.stack([empty if f.pressure is None else f.pressure for f in made]).astype(np.float32))
-    os.replace(temp, root / "forecasts.npz")
+    _save(root / "forecasts.npz", days=np.array(days),
+          cloud=np.stack([f.cloud for f in made]).astype(np.float32),
+          temp=np.stack([f.temp for f in made]).astype(np.float32),
+          issued=np.array([f.issued for f in made]),
+          net=np.array([f.net for f in made]),
+          temp_net=np.array([f.temp_net for f in made]),
+          pressure=np.stack([empty if f.pressure is None else f.pressure for f in made]).astype(np.float32))
 
 
-def load_steps(root):
-    path = root / "steps.npz"
-    if not path.exists():
-        return {}
-    with np.load(path) as saved:
-        days, values = saved["days"], saved["values"]
-    return {str(d): values[i] for i, d in enumerate(days)}
+def load_steps(root, name="steps"):
+    """Arrays stored by day, from steps.npz or, with name="aifs", the stored AIFS forecasts."""
+    saved = _load(root / f"{name}.npz")
+    return {str(d): values for d, values in zip(saved.get("days", ()), saved.get("values", ()))}
 
 
-def save_steps(root, steps):
+def save_steps(root, steps, name="steps"):
     days = sorted(steps)
-    if not days:
-        return
-    temp = root / "steps.tmp.npz"
-    np.savez_compressed(temp, days=np.array(days), values=np.stack([steps[d] for d in days]))
-    os.replace(temp, root / "steps.npz")
+    if days:
+        _save(root / f"{name}.npz", days=np.array(days), values=np.stack([steps[d] for d in days]))
 
 
 def add_days(history, hours, fields, today):
@@ -139,7 +135,7 @@ def add_steps(steps, hours, fields, today):
         if np.isnan(found).mean(axis=(2, 3)).max() > MAX_MISSING:
             print(f"::warning::weather: over {MAX_MISSING:.0%} of a 6-hourly field missing on {day}", file=sys.stderr)
             continue
-        steps[day.isoformat()] = np.stack([[_fill(field) for field in variable] for variable in found])
+        steps[day.isoformat()] = _fill(found)
     for old in sorted(steps)[:-STEP_DAYS]:
         del steps[old]
 
@@ -163,16 +159,22 @@ def days_to_fetch(history, steps, today):
     return max(oldest(history, fetch.BOOTSTRAP_DAYS), missing_step + 1 if missing_step else 0)
 
 
-def _fill(field):
-    """A rare missing cell takes the mean of its latitude row, or the global mean if the row is empty."""
-    if not np.isnan(field).any():
-        return field
-    field = field.copy()
-    with np.errstate(invalid="ignore"):
-        rows = np.array([np.nanmean(r) if not np.isnan(r).all() else np.nanmean(field) for r in field])
-    gaps = np.isnan(field)
-    field[gaps] = np.broadcast_to(rows[:, None], field.shape)[gaps]
-    return field
+def _fill(fields):
+    """A rare missing cell takes the mean of its latitude row, or of its whole field if the row is empty.
+
+    Takes one (lat, lon) field or any stack of them.
+    """
+    gaps = np.isnan(fields)
+    if not gaps.any():
+        return fields
+    count = (~gaps).sum(-1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rows = np.where(gaps, 0, fields).sum(-1, keepdims=True) / count
+    if (count == 0).any():
+        rows = np.where(count == 0, np.nanmean(fields, axis=(-2, -1), keepdims=True), rows)
+    filled = fields.copy()
+    filled[gaps] = np.broadcast_to(rows, fields.shape)[gaps]
+    return filled
 
 
 def consecutive(history, today):
@@ -190,23 +192,23 @@ def picture(field, top):
     return ["".join(RAMP[i] for i in row) for row in index[::-1]]
 
 
-def _forecast(cloud, temp, target, when, steps, saved, others=None):
-    """Forecasts a day from the days before it, as (cloud, temp, cloud by network, pressure or None, temp by network).
+def _forecast(cloud, temp, target, when, steps, saved, others=None, issued=False):
+    """Forecasts a day from the days before it.
 
     The networks need all 30 days of 6-hourly steps. When any is missing cloud and temperature come from the ridge, so
     a forecast is still kept, the flags say which model made it, and there is no pressure. `others` holds the networks
-    of the other targets, and a target without one takes the same fallback. Cover outside 0..100 cannot happen.
+    of the other targets, and a target without one takes the same fallback.
     """
-    others = others or {}
     held = cloudnet.view(steps, when)
     if held is None:
         print(f"::warning::weather: 6-hourly days missing before {when}, ridge forecasts only", file=sys.stderr)
-        found = weather.predict(cloud, target)[0]
+        found, by_net = weather.predict(cloud, target)[0], {}
     else:
         found = cloudnet.predict(held, when, saved)
-    by_net = {name: cloudnet.predict(held, when, net, name) for name, net in others.items()} if held is not None else {}
+        by_net = {name: cloudnet.predict(held, when, net, name) for name, net in (others or {}).items()}
     made_temp = by_net["temp"] if "temp" in by_net else weather.predict(temp, target)[0]
-    return np.clip(found, *CLOUD_RANGE), made_temp, held is not None, by_net.get("pressure"), "temp" in by_net
+    return Forecast(np.clip(found, *CLOUD_RANGE), made_temp, issued, held is not None, by_net.get("pressure"),
+                    "temp" in by_net)
 
 
 def keep_forecasts(forecasts, days, history, steps, today, saved, others=None):
@@ -217,12 +219,42 @@ def keep_forecasts(forecasts, days, history, steps, today, saved, others=None):
     cloud = np.stack([history[d][0] for d in days])
     temp = np.stack([history[d][1] for d in days])
     if today.isoformat() not in forecasts:
-        made = _forecast(cloud, temp, len(days), today, steps, saved, others)
-        forecasts[today.isoformat()] = Forecast(made[0], made[1], True, made[2], made[3], made[4])
+        forecasts[today.isoformat()] = _forecast(cloud, temp, len(days), today, steps, saved, others, issued=True)
     for target in range(max(len(days) - LOSS_DAYS, weather.MIN_TRAIN_DAYS + 3), len(days)):
         if days[target] not in forecasts:
-            made = _forecast(cloud, temp, target, date.fromisoformat(days[target]), steps, saved, others)
-            forecasts[days[target]] = Forecast(made[0], made[1], False, made[2], made[3], made[4])
+            when = date.fromisoformat(days[target])
+            forecasts[days[target]] = _forecast(cloud, temp, target, when, steps, saved, others)
+
+
+def aifs_day(hours, fields, day):
+    """A day's mean AIFS cloud, temperature and pressure as one (3, lat, lon) array, or None if the day is incomplete."""
+    pick = hours.astype("datetime64[D]") == np.datetime64(day)
+    if pick.sum() != 24:
+        return None
+    means = [_daily_mean(fields[name][pick]) for name in fetch.AIFS_VARIABLES]
+    if max(np.isnan(mean).mean() for mean in means) > MAX_MISSING:
+        return None
+    return _fill(np.stack(means))
+
+
+def keep_aifs(root, today):
+    """Stores ECMWF's AIFS forecast of today once, to score next to the networks. Returns every stored day.
+
+    A failed download is a warning: the weather section then goes out without AIFS, and a later run retries.
+    """
+    held = load_steps(root, "aifs")
+    if today.isoformat() not in held:
+        try:
+            found = aifs_day(*fetch.aifs(), today)
+        except fetch.SourceError as err:
+            found = None
+            print(f"::warning::aifs: {err}", file=sys.stderr)
+        if found is not None:
+            held[today.isoformat()] = found
+    for old in sorted(held)[:-(LOSS_DAYS + 1)]:
+        del held[old]
+    save_steps(root, held, "aifs")
+    return held
 
 
 def _pressure_of_day(steps, day):
@@ -230,40 +262,46 @@ def _pressure_of_day(steps, day):
     return steps[day][cloudnet.VARIABLES.index("pressure")].mean(0) if day in steps else None
 
 
-def forecast_losses(forecasts, history, steps=None):
-    """Area-weighted squared error of each stored forecast whose day has finished, and of repeating the day before."""
-    steps = steps or {}
+def forecast_losses(forecasts, history, steps=None, aifs=None):
+    """Area-weighted squared error of each stored forecast whose day has finished, of repeating the day before, and
+    of ECMWF's AIFS forecast of that day when one is stored."""
+    steps, aifs = steps or {}, aifs or {}
     rows = []
     for day in sorted(set(forecasts) & set(history))[-LOSS_DAYS:]:
-        before = history.get((date.fromisoformat(day) - timedelta(days=1)).isoformat())
-        row = {"date": day, "issued": forecasts[day][2], "net": forecasts[day][3]}
-        for i, name in enumerate(("cloud", "temp")):
-            row[name] = {"model": round(weather.mse(history[day][i], forecasts[day][i]), 1),
-                         "repeat": round(weather.mse(history[day][i], before[i]), 1) if before else None}
         made = Forecast(*forecasts[day])
+        yesterday = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        before = history.get(yesterday)
+        row = {"date": day, "issued": made.issued, "net": made.net}
+        for i, name in enumerate(("cloud", "temp")):
+            row[name] = {"model": round(weather.mse(history[day][i], made[i]), 1),
+                         "repeat": round(weather.mse(history[day][i], before[i]), 1) if before else None}
+            if day in aifs:
+                row[name]["aifs"] = round(weather.mse(history[day][i], aifs[day][i]), 1)
         truth = _pressure_of_day(steps, day)
         if made.pressure is not None and truth is not None:
-            earlier = _pressure_of_day(steps, (date.fromisoformat(day) - timedelta(days=1)).isoformat())
+            earlier = _pressure_of_day(steps, yesterday)
             row["pressure"] = {"model": round(weather.mse(truth, made.pressure), 1),
                                "repeat": round(weather.mse(truth, earlier), 1) if earlier is not None else None}
+            if day in aifs:
+                row["pressure"]["aifs"] = round(weather.mse(truth, aifs[day][2]), 1)
         rows.append(row)
     return rows
 
 
-def weather_section(days, history, forecasts, today):
+def weather_section(days, history, forecasts, today, aifs=None):
     made = Forecast(*forecasts[today.isoformat()])
-    cloud, temp, net = made.cloud, made.temp, made.net
-    networks = [name for name, by_net in (("cloud", net), ("temp", made.temp_net), ("pressure", made.pressure is not None)) if by_net]
+    networks = [name for name, by_net in (("cloud", made.net), ("temp", made.temp_net), ("pressure", made.pressure is not None))
+                if by_net]
     section = {
         "train_days": len(days),
         "today": {
             "date": today.isoformat(),
-            "net": net,
-            "places": weather.at_places(cloud, temp),
-            "map": picture(cloud, 100),
+            "net": made.net,
+            "places": weather.at_places(made.cloud, made.temp),
+            "map": picture(made.cloud, 100),
             # Whole percent and whole degrees, south to north and west to east, for the viewer's map.
-            "cloud": np.clip(cloud, *CLOUD_RANGE).round().astype(int).ravel().tolist(),
-            "temp": np.asarray(temp).round().astype(int).ravel().tolist(),
+            "cloud": np.clip(made.cloud, *CLOUD_RANGE).round().astype(int).ravel().tolist(),
+            "temp": np.asarray(made.temp).round().astype(int).ravel().tolist(),
             "networks": networks,
         },
         "last_scored": {"date": days[-1], "actual": picture(history[days[-1]][0], 100)},
@@ -271,6 +309,13 @@ def weather_section(days, history, forecasts, today):
     if made.pressure is not None:
         # A tenth of a hPa keeps the viewer's isobars from stepping.
         section["today"]["pressure"] = np.asarray(made.pressure, dtype=np.float64).round(1).ravel().tolist()
+    if aifs and today.isoformat() in aifs:
+        cloud, temp, pressure = np.asarray(aifs[today.isoformat()], dtype=np.float64)
+        # CC BY 4.0 asks for the source to be named wherever the data is shown.
+        section["today"]["aifs"] = {"model": "ECMWF AIFS Single", "licence": "CC BY 4.0", "via": "Open-Meteo",
+                                    "cloud": cloud.round().astype(int).ravel().tolist(),
+                                    "temp": temp.round().astype(int).ravel().tolist(),
+                                    "pressure": pressure.round(1).ravel().tolist()}
     return section
 
 
@@ -305,7 +350,8 @@ def update_weather(root, today):
     saved = cloudnet.load()
     keep_forecasts(forecasts, days, history, steps, today, saved, cloudnet.load_others(saved))
     save_forecasts(root, forecasts)
-    return {**weather_section(days, history, forecasts, today), "losses": forecast_losses(forecasts, history, steps)}
+    aifs = keep_aifs(root, today)
+    return {**weather_section(days, history, forecasts, today, aifs), "losses": forecast_losses(forecasts, history, steps, aifs)}
 
 
 def stored_losses(root):
